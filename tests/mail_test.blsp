@@ -1,0 +1,167 @@
+;; The builder, address parsing, validation, the delivery contract against the two shipped
+;; adapters, and an adapter that raises. No network anywhere.
+(defmodule mail-test
+  (:use test)
+  (:alias mail)
+  ;; the ability an `impl` names must be visible bare — qualified, it registers under a
+  ;; name `mail/deliver` never dispatches on
+  (:use mail :only [Adapter])
+  (:alias telemetry))
+
+(defn- ready ()
+  (-> (mail/new)
+    (mail/from "Hive <noreply@brood.fly.dev>")
+    (mail/to "ada@example.com")
+    (mail/subject "Hi")
+    (mail/text-body "hello")))
+
+(describe "address"
+  (test "every spelling normalises to {:name :email}"
+    (assert= {:name nil :email "ada@x.io"} (mail/address "ada@x.io"))
+    (assert= {:name "Ada" :email "ada@x.io"} (mail/address "Ada <ada@x.io>"))
+    (assert= {:name "Ada Lovelace" :email "ada@x.io"} (mail/address "  Ada Lovelace < ada@x.io > "))
+    (assert= {:name "Ada" :email "ada@x.io"} (mail/address ["Ada" "ada@x.io"]))
+    (assert= {:name "Ada" :email "ada@x.io"} (mail/address {:name "Ada" :email "ada@x.io"})))
+
+  (test "an empty or shapeless value raises, naming the function"
+    (is (includes? (error-message (try (mail/address "") (catch e e))) "mail/address"))
+    (is (includes? (error-message (try (mail/address 42) (catch e e))) "mail/address"))
+    (is (includes? (error-message (try (mail/address {:name "x"}) (catch e e))) "mail/address"))))
+
+(describe "composing"
+  (test "recipients accumulate, singly or as a vector, in every spelling"
+    (let (email (-> (mail/new)
+                  (mail/to "a@x.io")
+                  (mail/to ["b@x.io" "Cee <c@x.io>"])
+                  (mail/to ["Dee" "d@x.io"])
+                  (mail/cc {:name nil :email "e@x.io"})
+                  (mail/bcc "f@x.io")))
+      (assert= ["a@x.io" "b@x.io" "c@x.io" "d@x.io"]
+        (vec (map (get email :to) (fn (a) (get a :email)))))
+      (assert= "Dee" (get (nth (get email :to) 3) :name))
+      (assert= [{:name nil :email "e@x.io"}] (get email :cc))
+      (assert= [{:name nil :email "f@x.io"}] (get email :bcc))
+      (assert= 6 (count (mail/recipients email)))))
+
+  (test "new takes the fields as a plist"
+    (let (email (mail/new :from "a@x.io" :to "b@x.io" :subject "S" :text "T" :html "<p>H</p>"))
+      (assert= "a@x.io" (get (get email :from) :email))
+      (assert= "S" (get email :subject))
+      (assert= "T" (get email :text))
+      (assert= "<p>H</p>" (get email :html))
+      (assert= :ok (mail/validate email))))
+
+  (test "headers, reply-to and provider options"
+    (let (email (-> (mail/new)
+                  (mail/reply-to "Support <help@x.io>")
+                  (mail/header "X-Campaign" "welcome")
+                  (mail/header :x-priority 1)
+                  (mail/provider-option :template-id 12)))
+      (assert= {:name "Support" :email "help@x.io"} (get email :reply-to))
+      (assert= {"X-Campaign" "welcome" ":x-priority" "1"} (get email :headers))
+      (assert= {:template-id 12} (get email :provider-options))))
+
+  (test "an attachment from data infers its content type; an explicit one wins"
+    (let (email (-> (mail/new)
+                  (mail/attachment {:filename "report.PDF" :data #b"%PDF"})
+                  (mail/attachment {:filename "x.bin"
+                                    :data "raw"
+                                    :content-type "text/x-raw"
+                                    :disposition :inline
+                                    :cid "logo"})))
+      (assert= 2 (count (get email :attachments)))
+      (assert= "application/pdf" (get (first (get email :attachments)) :content-type))
+      (assert= :attachment (get (first (get email :attachments)) :disposition))
+      (assert= "text/x-raw" (get (second (get email :attachments)) :content-type))
+      (assert= "logo" (get (second (get email :attachments)) :cid))
+      (assert= "application/octet-stream" (mail/content-type-for "weird.xyz"))))
+
+  (test "an attachment from a path reads the file and takes its basename"
+    (let (p (path/temp "mail-att"))
+      (file/spit p "csv,data")
+      (let (email (mail/attachment (mail/new) p)
+            att (first (get email :attachments)))
+        (assert= (path/basename p) (get att :filename))
+        (assert= "csv,data" (string/bytes-> (get att :data)))))))
+
+(describe "validate"
+  (test "names the first thing missing, in the order a sender fixes them"
+    (assert= [:error "mail: no sender — set `from`"] (mail/validate (mail/new)))
+    (assert= [:error "mail: no recipient — set `to`, `cc` or `bcc`"]
+      (mail/validate (mail/from (mail/new) "a@x.io")))
+    (assert= [:error "mail: no body — set `text-body` or `html-body`"]
+      (mail/validate (-> (mail/new) (mail/from "a@x.io") (mail/bcc "b@x.io"))))
+    (assert= :ok (mail/validate (ready)))))
+
+(describe "deliver through the memory adapter"
+  (test "keeps every email, notifies a process, answers [:ok {:id}]"
+    (let (adapter (mail/memory-adapter :notify (self))
+          outcome (mail/deliver (ready) adapter))
+      (assert= :ok (first outcome))
+      (is (string? (get (second outcome) :id)))
+      (assert= 1 (count (mail/delivered adapter)))
+      (assert= "Hi" (get (first (mail/delivered adapter)) :subject))
+      (receive
+        ([:mail email] (assert= "ada@example.com" (get (first (get email :to)) :email)))
+        (after 1000 (error "no [:mail email] notification")))
+      (mail/clear adapter)
+      (assert= [] (mail/delivered adapter))
+      (mail/stop adapter)))
+
+  (test "an invalid email is refused before the adapter sees it"
+    (let (adapter (mail/memory-adapter))
+      (assert= [:error "mail: no sender — set `from`"] (mail/deliver (mail/new) adapter))
+      (assert= [] (mail/delivered adapter))
+      (mail/stop adapter))))
+
+;; An adapter that raises, and one that answers each of the shapes the contract allows.
+(defrecord scripted (name outcome))
+(impl Adapter
+  scripted
+  (transmit [adapter email]
+    (let (outcome (get adapter :outcome))
+      (if (= outcome :raise) (error "socket closed") outcome))))
+
+(describe "the delivery contract"
+  (test "a raise inside the adapter is an [:error message], not a crash"
+    (assert= [:error "mail: socket closed"] (mail/deliver (ready) (scripted "s" :raise))))
+
+  (test "an adapter's [:ok …] and [:error …] pass through; a bare :ok is [:ok {}]"
+    (assert= [:ok {:id "m1"}] (mail/deliver (ready) (scripted "s" [:ok {:id "m1"}])))
+    (assert= [:error "refused"] (mail/deliver (ready) (scripted "s" [:error "refused"])))
+    (assert= [:ok {}] (mail/deliver (ready) (scripted "s" :ok))))
+
+  (test "any other answer is an error naming it"
+    (assert= [:error "mail: adapter answered 42"] (mail/deliver (ready) (scripted "s" 42))))
+
+  ;; The telemetry listener is global: a handler attached here sees every delivery in the
+  ;; run, so this test runs alone (`:isolated`) rather than filtering other tests' events.
+  (test "every delivery emits telemetry a monitor can attach to"
+    :isolated (when (nil? (telemetry/pid)) (telemetry/start))
+    (let (me (self))
+      (telemetry/attach :mail-test
+        [:mail :deliver :stop]
+        (fn (event measurements metadata) (send me [:seen event metadata])))
+      (mail/deliver (ready) (scripted "s" [:ok {}]))
+      (receive
+        ([:seen event metadata] (assert= [:mail :deliver :stop] event)
+          (assert= "s" (get metadata :adapter))
+          (assert= 1 (get metadata :recipients))
+          (assert= "Hi" (get metadata :subject))
+          (assert= :ok (get metadata :result)))
+        (after 1000 (error "no telemetry event")))
+      (telemetry/detach :mail-test))))
+
+(describe "the log adapter"
+  (test "summarises the email and sends nothing"
+    (assert= "mail to ada@example.com from noreply@brood.fly.dev: \"Hi\" [text]"
+      (mail/summary (ready)))
+    (assert= "mail to a@x.io, b@x.io from f@x.io: \"S\" [html] [text] [1 attached]"
+      (mail/summary (-> (mail/new :from
+                          "f@x.io"
+                          :to ["a@x.io" "b@x.io"]
+                          :subject "S"
+                          :text "t"
+                          :html "h")
+                      (mail/attachment {:filename "a.txt" :data "x"}))))
+    (assert= :ok (first (mail/deliver (ready) (mail/log-adapter :level :debug))))))

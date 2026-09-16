@@ -1,0 +1,352 @@
+;; mail — compose an email and deliver it through a swappable adapter.
+;;
+;; Swoosh's shape, for Brood: an email is a plain map built up by small functions, and
+;; delivery is one call against an adapter — any value with a `Adapter` impl. This package
+;; knows no vendor; an adapter package (mail-mailjet, …) is the wire format, and this is
+;; everything around it: the builder, the address parsing, validation, the delivery
+;; contract, telemetry, and the two adapters every app needs before it has a vendor —
+;; `memory-adapter` for tests and `log-adapter` for development.
+;;
+;; Design notes (the *why*; the *what* is in the docstrings):
+;;  - **An email is data, not a record.** A map with known keys prints, compares and
+;;    `assoc`s like anything else, a test can build one by hand, and an adapter reads it
+;;    with `get`. The builder functions exist for the ergonomics, not as the only way in.
+;;  - **Addresses are normalised at the edge.** Every recipient is `{:name :email}` by
+;;    the time an adapter sees it, whatever the caller wrote — a bare address, a
+;;    `"Name <address>"` string, a `["Name" "address"]` pair — so an adapter never parses.
+;;  - **Delivery is synchronous and returns a value.** `[:ok result]` or `[:error message]`,
+;;    never a raise: a mailer's failure is an ordinary outcome of a request, and the
+;;    caller chooses what to do with it. Sending off the request path is the caller's
+;;    `spawn`, not this package's — a queue is a different library.
+;;  - **Validation is here, once.** No adapter has to check for a missing sender; the
+;;    error names the field, and no request is made.
+(defmodule mail
+  "Compose an email and deliver it through an adapter.
+
+      (def adapter (mail-mailjet/adapter {:api-key (os/env \"MAILJET_API_KEY\")
+                                          :secret-key (os/env \"MAILJET_SECRET_KEY\")}))
+      (-> (mail/new)
+          (mail/from \"Hive <noreply@brood.fly.dev>\")
+          (mail/to \"ada@example.com\")
+          (mail/subject \"Your token\")
+          (mail/text-body \"…\")
+          (mail/html-body \"<p>…</p>\")
+          (mail/deliver adapter))
+      ;; → [:ok {:id \"…\"}] or [:error \"…\"]
+
+  An adapter is any value with an `Adapter` impl; `memory-adapter` keeps what was sent
+  for a test to read back, `log-adapter` writes a summary line through `log`."
+  (:alias gen)
+  (:alias log)
+  (:alias telemetry)
+  (:alias os)
+  (:alias path)
+  (:alias file)
+  (:alias seq)
+  (:alias string))
+
+;; ---- the Adapter ability --------------------------------------------------------------
+
+(defability Adapter
+  "How an email leaves the process. `transmit` is handed a validated email (every address
+  normalised to `{:name :email}`, at least one recipient, a sender) and returns
+  `[:ok result]` — `result` a map, `:id` the provider's message id when it has one —
+  or `[:error message]`. A raise is caught by `mail/deliver` and becomes `[:error message]`,
+  so an implementation may let `http/request`'s failures surface."
+  (transmit [self email] :-> any))
+
+;; ---- composing --------------------------------------------------------------------------
+
+(defn new (& opts)
+  "An empty email, or one with fields set from a plist: `(new :to \"a@b.c\" :subject \"Hi\")`
+  applies each key through the builder of the same name, so an address may be written any
+  way `to` accepts."
+  (fold (partition opts 2)
+    {:from nil
+     :to []
+     :cc []
+     :bcc []
+     :reply-to nil
+     :subject ""
+     :text nil
+     :html nil
+     :headers {}
+     :attachments []
+     :provider-options {}}
+    (fn (email pair)
+      (let (key (first pair) value (second pair))
+        (case key
+          :from (from email value)
+          :to (to email value)
+          :cc (cc email value)
+          :bcc (bcc email value)
+          :reply-to (reply-to email value)
+          :subject (subject email value)
+          :text (text-body email value)
+          :html (html-body email value)
+          (error "mail/new: unknown field " key))))))
+
+(defn address (value)
+  "`value` as `{:name :email}`: a bare address, a `\"Name <address>\"` string, a
+  `[\"Name\" \"address\"]` pair, or a map already in that shape. `:name` is nil when there
+  is none. Raises on an empty or nameless-and-addressless value."
+  (cond
+    (map? value)
+      (if (string? (get value :email))
+        {:name (get value :name) :email (string/trim (get value :email))}
+        (error "mail/address: a map address needs :email: " value))
+    (vector? value)
+      (if (= (count value) 2)
+        {:name (nth value 0) :email (string/trim (str (nth value 1)))}
+        (error "mail/address: a pair address is [name email]: " value))
+    (string? value) (parse-address value)
+    :else (error "mail/address: not an address: " value)))
+
+;; `Name <address>` or a bare address. The angle-bracket form is what a mail header carries
+;; and what a person types, so it is read here rather than left to every caller.
+(defn- parse-address (text)
+  (let (trimmed (string/trim text)
+        open (index-of trimmed "<")
+        close (string/last-index-of trimmed ">"))
+    (cond
+      (= trimmed "") (error "mail/address: empty address")
+      (and (>= open 0) (> close open))
+        (let (name (string/trim (string/substring trimmed 0 open)))
+          {:name (if (= name "") nil name)
+           :email (string/trim (string/substring trimmed (+ open 1) close))})
+      :else {:name nil :email trimmed})))
+
+;; A vector is a LIST of addresses unless it reads as one `[name address]` pair: two strings
+;; of which only the second has an `@`. `["ada@x" "bob@y"]` is two recipients; `["Ada" "ada@x"]`
+;; is one.
+(defn- address-pair? (value)
+  (and (vector? value)
+    (= (count value) 2)
+    (string? (nth value 0))
+    (string? (nth value 1))
+    (not (includes? (nth value 0) "@"))
+    (includes? (nth value 1) "@")))
+
+(defn- add-recipients (email field value)
+  (let (added (if (and (vector? value) (not (address-pair? value)))
+                (map value address)
+                [(address value)]))
+    (assoc email field (into (get email field []) added))))
+
+(defn to (email recipient)
+  "Add a recipient. `recipient` is an address (see `address`) or a vector of addresses;
+  recipients accumulate, so `to` may be called more than once."
+  (add-recipients email :to recipient))
+
+(defn cc (email recipient)
+  "Add a Cc recipient — an address or a vector of them; accumulates like `to`."
+  (add-recipients email :cc recipient))
+
+(defn bcc (email recipient)
+  "Add a Bcc recipient — an address or a vector of them; accumulates like `to`."
+  (add-recipients email :bcc recipient))
+
+(defn from (email sender)
+  "Set the sender (any address form)."
+  (assoc email :from (address sender)))
+
+(defn reply-to (email recipient)
+  "Set the Reply-To address (any address form)."
+  (assoc email :reply-to (address recipient)))
+
+(defn subject (email text)
+  "Set the subject line."
+  (assoc email :subject (str text)))
+
+(defn text-body (email text)
+  "Set the plain-text body."
+  (assoc email :text (str text)))
+
+(defn html-body (email html)
+  "Set the HTML body. An email with both bodies is sent as both; a client shows the one
+  it prefers."
+  (assoc email :html (str html)))
+
+(defn header (email name value)
+  "Set a custom header, e.g. `(header email \"X-Campaign\" \"welcome\")`. The name is kept
+  as written; adapters that constrain header names say so."
+  (assoc email :headers (assoc (get email :headers {}) (str name) (str value))))
+
+(defn provider-option (email key value)
+  "Set an option only a particular adapter understands — a template id, a tag, a
+  sandbox flag. Every adapter documents the keys it reads and ignores the rest."
+  (assoc email :provider-options (assoc (get email :provider-options {}) key value)))
+
+;; A small table for the attachment types a web app actually sends; anything else is
+;; `application/octet-stream`, which every receiver stores and none refuses.
+(def *content-types*
+  {"pdf" "application/pdf"
+   "png" "image/png"
+   "jpg" "image/jpeg"
+   "jpeg" "image/jpeg"
+   "gif" "image/gif"
+   "svg" "image/svg+xml"
+   "txt" "text/plain"
+   "csv" "text/csv"
+   "html" "text/html"
+   "json" "application/json"
+   "zip" "application/zip"
+   "ics" "text/calendar"})
+
+(defn content-type-for (filename)
+  "The content type a file name's extension implies, `application/octet-stream` when it
+  implies none."
+  (let (extension (string/lower (path/extension (str filename)))
+        bare (if (string/starts-with? extension ".")
+               (string/substring extension 1 (string/length extension))
+               extension))
+    (get *content-types* bare "application/octet-stream")))
+
+(defn attachment (email spec)
+  "Attach a file. `spec` is a path (read now, named by its basename) or a map:
+  `:filename`, `:data` (a string or `bytes`) or `:path`, optional `:content-type`
+  (inferred from the name when absent), `:disposition` (`:attachment`, the default, or
+  `:inline`) and `:cid` for an inline image referenced from the HTML body as `cid:…`."
+  (let (given (if (string? spec) {:path spec} spec)
+        source (get given :path)
+        filename (or (get given :filename) (and source (path/basename source)))
+        data (or (get given :data) (and source (file/slurp-bytes source))))
+    (when (nil? filename) (error "mail/attachment: an attachment needs a :filename or :path"))
+    (when (nil? data) (error "mail/attachment: an attachment needs :data or :path"))
+    (assoc email
+      :attachments
+        (conj (get email :attachments [])
+          {:filename (str filename)
+           :content-type (or (get given :content-type) (content-type-for filename))
+           :data data
+           :disposition (get given :disposition :attachment)
+           :cid (get given :cid)}))))
+
+;; ---- delivering -------------------------------------------------------------------------
+
+(defn recipients (email)
+  "Every recipient — To, Cc and Bcc — as one vector of `{:name :email}`."
+  (into (into (vec (get email :to [])) (get email :cc [])) (get email :bcc [])))
+
+(defn validate (email)
+  "`:ok` when the email can be sent, else `[:error message]` naming the first missing
+  piece: a sender, at least one recipient, a body."
+  (cond
+    (nil? (get email :from)) [:error "mail: no sender — set `from`"]
+    (empty? (recipients email)) [:error "mail: no recipient — set `to`, `cc` or `bcc`"]
+    (and (nil? (get email :text)) (nil? (get email :html)))
+      [:error "mail: no body — set `text-body` or `html-body`"]
+    :else :ok))
+
+(defn- elapsed-ms (started-ns)
+  (/ (- (os/now-ns) started-ns) 1000000.0))
+
+(defn- adapter-name (adapter)
+  (str (or (and (map? adapter) (get adapter :name)) (type-of adapter))))
+
+(defn deliver (email adapter)
+  "Deliver `email` through `adapter`. Validates first (`validate`), then calls the
+  adapter's `deliver`, and answers `[:ok result]` or `[:error message]` — a raise inside
+  the adapter is caught and reported the same way, so a caller has one shape to match.
+
+  Emits `[:mail :deliver :stop]` (measurement `:duration` ms; metadata `:adapter`,
+  `:recipients`, `:subject`, `:result`) or `[:mail :deliver :exception]` through
+  `telemetry`, so a monitoring library sees every send without instrumentation."
+  (let (started (os/now-ns)
+        metadata {:adapter (adapter-name adapter)
+                  :recipients (count (recipients email))
+                  :subject (get email :subject "")})
+    (match (validate email)
+      ([:error message] [:error message])
+      (_ (try
+           (let (outcome (transmit adapter email)
+                 result (match outcome
+                          ([:ok _] outcome)
+                          ([:error _] outcome)
+                          (:ok [:ok {}])
+                          (other [:error (str "mail: adapter answered " (pr-str other))])))
+             (telemetry/emit [:mail :deliver :stop]
+               {:duration (elapsed-ms started)}
+               (assoc metadata :result (first result)))
+             result)
+           (catch caught
+             (telemetry/emit [:mail :deliver :exception]
+               {:duration (elapsed-ms started)}
+               (assoc metadata :error (error-message caught)))
+             [:error (str "mail: " (error-message caught))]))))))
+
+;; ---- the memory adapter ------------------------------------------------------------------
+;; What a test uses: every delivered email is kept, newest last, and read back with
+;; `delivered`. Optionally each one is also sent to a process as `[:mail email]`, so a test
+;; can `receive` it rather than poll.
+
+(gen/defserver mailbox
+  (state)
+  (cast [:deliver email]
+    (let (notify (get state :notify))
+      (when notify (send notify [:mail email]))
+      (assoc state :emails (conj (get state :emails) email))))
+  (cast :clear (assoc state :emails []))
+  (query :emails (get state :emails)))
+
+(defrecord memory (name pid))
+
+(defn memory-adapter (& opts)
+  "An adapter that keeps every email it is handed, for a test or a REPL. `:notify pid`
+  also sends each one to `pid` as `[:mail email]`. Read them back with `delivered`; drop
+  them with `clear`; `stop` the process when done."
+  (let (options (apply hash-map opts))
+    (memory "memory" (gen/start mailbox {:emails [] :notify (get options :notify)}))))
+
+(impl Adapter
+  memory
+  (transmit [adapter email]
+    (gen/cast (get adapter :pid) [:deliver email])
+    [:ok {:id (str "memory-" (os/now))}]))
+
+(defn delivered (adapter)
+  "The emails a `memory-adapter` has delivered, oldest first."
+  (gen/call (get adapter :pid) :emails))
+
+(defn clear (adapter)
+  "Forget what a `memory-adapter` has delivered."
+  (gen/cast (get adapter :pid) :clear))
+
+(defn stop (adapter)
+  "Stop a `memory-adapter`'s process."
+  (gen/stop (get adapter :pid)))
+
+;; ---- the log adapter -----------------------------------------------------------------------
+
+(defrecord logging (name level))
+
+(defn log-adapter (& opts)
+  "An adapter that writes one line per email through `log` (`:level`, default `:info`)
+  and sends nothing — development, or a deploy that has no mail credentials yet."
+  (let (options (apply hash-map opts))
+    (logging "log" (get options :level :info))))
+
+(defn summary (email)
+  "One line describing an email: sender, recipients, subject, and what it carries."
+  (str "mail to "
+    (string/join (map (recipients email) (fn (a) (get a :email))) ", ")
+    " from "
+    (get (get email :from {}) :email)
+    ": "
+    (pr-str (get email :subject ""))
+    (if (get email :html) " [html]" "")
+    (if (get email :text) " [text]" "")
+    (let (n (count (get email :attachments []))) (if (> n 0) (str " [" n " attached]") ""))))
+
+(defn- log-line (level line)
+  (case level
+    :debug (log/debug line)
+    :warn (log/warn line)
+    :error (log/error line)
+    (log/info line)))
+
+(impl Adapter
+  logging
+  (transmit [adapter email]
+    (log-line (get adapter :level) (summary email))
+    [:ok {:id (str "log-" (os/now))}]))

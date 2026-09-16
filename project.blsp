@@ -1,0 +1,10 @@
+;; mail — compose an email and deliver it through a swappable adapter. Vendor-neutral: an
+;; adapter is any value with an `Adapter` impl (mail-mailjet is the first; mail-local keeps
+;; them in-process with a page to read them).
+(project
+  :name "mail"
+  :version "0.1.0"
+  :brood ">= 0.29.2"
+  :description
+    "Compose an email and deliver it through a swappable adapter — Swoosh, for Brood. Builder, address parsing, validation, telemetry, and memory/log adapters; pair with an adapter package such as mail-mailjet."
+  :repository "https://github.com/broodlang/mail")
