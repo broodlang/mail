@@ -2,10 +2,11 @@
 ;;
 ;; Swoosh's shape, for Brood: an email is a plain map built up by small functions, and
 ;; delivery is one call against an adapter — any value with a `Adapter` impl. This package
-;; knows no vendor; an adapter package (mail-mailjet, …) is the wire format, and this is
-;; everything around it: the builder, the address parsing, validation, the delivery
-;; contract, telemetry, and the two adapters every app needs before it has a vendor —
-;; `memory-adapter` for tests and `log-adapter` for development.
+;; is everything around the wire: the builder, the address parsing, validation, the
+;; delivery contract, telemetry — and the adapters an app reaches for first, built in:
+;; `mail/local` (a mailbox with a page to read it), `mail/mailjet` (the first vendor),
+;; `memory-adapter` for tests and `log-adapter` for development. Another vendor is the
+;; same shape in its own package: a value with an `Adapter` impl.
 ;;
 ;; Design notes (the *why*; the *what* is in the docstrings):
 ;;  - **An email is data, not a record.** A map with known keys prints, compares and
@@ -23,7 +24,7 @@
 (defmodule mail
   "Compose an email and deliver it through an adapter.
 
-      (def adapter (mail-mailjet/adapter {:api-key (os/env \"MAILJET_API_KEY\")
+      (def adapter (mail/mailjet/adapter {:api-key (os/env \"MAILJET_API_KEY\")
                                           :secret-key (os/env \"MAILJET_SECRET_KEY\")}))
       (-> (mail/new)
           (mail/from \"Hive <noreply@brood.fly.dev>\")
@@ -34,8 +35,9 @@
           (mail/deliver adapter))
       ;; → [:ok {:id \"…\"}] or [:error \"…\"]
 
-  An adapter is any value with an `Adapter` impl; `memory-adapter` keeps what was sent
-  for a test to read back, `log-adapter` writes a summary line through `log`."
+  An adapter is any value with an `Adapter` impl. Built in: `mail/local` (an in-process
+  mailbox with a page to read it), `mail/mailjet`, `memory-adapter` (keeps what was sent
+  for a test to read back) and `log-adapter` (a summary line through `log`)."
   (:alias gen)
   (:alias log)
   (:alias telemetry)

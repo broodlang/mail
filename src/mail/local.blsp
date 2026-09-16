@@ -1,0 +1,350 @@
+;; mail/local — a `mail` adapter that keeps every email in this process, and a page that
+;; shows them: Swoosh's mailbox preview.
+;;
+;; Development needs to SEE the email a flow produced without a vendor account, a real
+;; inbox, or a network; staging wants the same behind a guard. So: an adapter that delivers
+;; into a keeper process instead of onto the wire, and a page that lists the mailbox and
+;; opens one email — headers, the HTML body as it would render, the text body, the
+;; attachments to download.
+;;
+;; Design notes:
+;;  - **Bounded, newest kept.** `*max-emails*` at most; the oldest go first. A long-running
+;;    staging deploy must not grow without limit because someone forgot the mailbox.
+;;  - **The HTML body renders in a sandboxed iframe from its own URL**, never inline. An
+;;    email's HTML is content the app produced from data — a user's name, a comment — and
+;;    the page reading it is signed in as a developer. `sandbox` with no allowances runs
+;;    no script, and a `Content-Security-Policy: sandbox` header says the same thing to a
+;;    browser that opened the URL directly.
+;;  - **Pages are pure over a snapshot.** `page` takes the state (a test hands one in), the
+;;    handler is the thin conn wrapper — the shape observe-local set.
+(defmodule mail/local
+  "A `mail` adapter that keeps every email here, with a page to read them.
+
+      (def mailer (mail/local/adapter))
+      (mail/deliver email mailer)          ; → [:ok {:id 1}]
+      (mail/local/emails)                  ; newest first, each with :id and :at
+      ;; in the router, behind whatever guards the operational pages:
+      (get \"/mailbox\" (mail/local/handler))
+      (get \"/mailbox/*path\" (mail/local/handler))
+
+  `(mail/local/adapter)` starts the keeper (registered `:mail/local`) if it is not
+  running; `clear` empties it; `stop` ends it."
+  (:use mail :only [Adapter])
+  (:alias mail)
+  (:alias gen)
+  (:alias proc)
+  (:alias math)
+  (:alias os)
+  (:alias seq)
+  (:alias string)
+  (:alias datetime)
+  (:alias web/conn)
+  (:alias web/template)
+  ; refresh-script — the same self-refresh hatch's operational pages have
+  (:alias web/dashboard))
+
+(def *max-emails* 200)
+
+;; ---- the state (pure) ---------------------------------------------------------------------
+
+(defn empty-state ()
+  "A mailbox with nothing in it."
+  {:emails [] :next-id 1})
+
+(defn add-email (state email &optional (at nil))
+  "`state` with `email` kept as the newest entry, stamped `:id` and `:at` (epoch ms,
+  `at` or now); the oldest entry goes when the mailbox is full."
+  (let (id (get state :next-id)
+        entry (assoc email :id id :at (or at (os/now)))
+        kept (conj (get state :emails) entry)
+        trimmed (if (> (count kept) *max-emails*)
+                  (vec (drop kept (- (count kept) *max-emails*)))
+                  kept))
+    {:emails trimmed :next-id (inc id)}))
+
+(defn emails-of (state)
+  "The mailbox, newest first."
+  (vec (reverse (get state :emails))))
+
+(defn email-of (state id)
+  "The entry with `id`, or nil."
+  (first (seq/filter (get state :emails) (fn (entry) (= (get entry :id) id)))))
+
+;; ---- the keeper -----------------------------------------------------------------------------
+
+(gen/defserver keeper
+  (state)
+  "Holds the mailbox; a delivery is a call so the caller learns its id, the page reads a snapshot."
+  (call [:deliver email]
+    (let (next (add-email state email)) [(get state :next-id) next]))
+  (cast :clear (empty-state))
+  (query :snapshot state))
+
+(defn start ()
+  "Start the keeper, registered as `:mail/local`; idempotent. Returns its pid."
+  (or (proc/whereis :mail/local)
+    (let (pid (gen/start keeper (empty-state)))
+      (proc/register :mail/local pid)
+      pid)))
+
+(defn pid ()
+  "The keeper's pid, or nil."
+  (proc/whereis :mail/local))
+
+(defn stop ()
+  "Stop the keeper, forgetting everything. Returns nil. The name goes first, so `pid` is
+  nil the moment this returns — `gen/stop` itself is asynchronous."
+  (let (p (pid))
+    (when p
+      (proc/unregister :mail/local)
+      (gen/stop p)))
+  nil)
+
+(defn clear ()
+  "Empty the mailbox, keep running."
+  (let (p (pid)) (when p (gen/cast p :clear)))
+  nil)
+
+(defn snapshot ()
+  "The whole state, or an empty one when the keeper is not running."
+  (let (p (pid)) (if p (gen/call p :snapshot) (empty-state))))
+
+(defn emails ()
+  "The mailbox, newest first."
+  (emails-of (snapshot)))
+
+(defn email (id)
+  "The entry with `id`, or nil."
+  (email-of (snapshot) id))
+
+;; ---- the adapter ----------------------------------------------------------------------------
+
+(defrecord local (name pid))
+
+(impl Adapter
+  local
+  (transmit [adapter email]
+    [:ok {:id (gen/call (get adapter :pid) [:deliver email])}]))
+
+(defn adapter ()
+  "The local adapter, over a running keeper (started if need be)."
+  (local "local" (start)))
+
+;; ---- the pages ------------------------------------------------------------------------------
+
+(def- *styles*
+  (str "body{font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;margin:0;"
+    "background:#0f1115;color:#d7dae0}" ".wrap{max-width:72rem;margin:0 auto;padding:2rem 1.25rem}"
+    "h1{font-size:1.1rem;letter-spacing:.08em;text-transform:uppercase;color:#8b93a1;margin:0 0 1rem}"
+    "h1 a{color:inherit;text-decoration:none}"
+    "h2{font-size:.8rem;text-transform:uppercase;letter-spacing:.08em;color:#8b93a1;margin:1.5rem 0 .6rem;font-weight:600}"
+    "table{width:100%;border-collapse:collapse}"
+    "th{text-align:left;font-weight:500;color:#8b93a1;font-size:.75rem;text-transform:uppercase;"
+    "letter-spacing:.06em;padding:.5rem .6rem;border-bottom:1px solid #232833}"
+    "td{padding:.45rem .6rem;border-bottom:1px solid #1a1e26;vertical-align:top}"
+    "td.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}"
+    "th.k{width:8rem;text-transform:none;letter-spacing:0;font-size:inherit}"
+    "a{color:#7aa2f7}.dim{color:#5c6370}"
+    "pre{background:#161a21;border:1px solid #232833;border-radius:8px;padding:.75rem 1rem;overflow-x:auto;white-space:pre-wrap}"
+    "iframe{width:100%;height:32rem;background:#fff;border:1px solid #232833;border-radius:8px}"
+    ".tag{display:inline-block;background:#232833;border-radius:4px;padding:0 .4rem;margin-right:.3rem;font-size:.8rem}"
+    ".actions{margin:1rem 0}.actions a{margin-right:1rem}"
+    "footer{color:#5c6370;font-size:.75rem;margin-top:1.5rem}"))
+
+(defn- when-at (ms)
+  (if (int? ms) (datetime/format (datetime/epoch-ms-> ms) "%Y-%m-%d %H:%M:%S") "—"))
+
+(defn- href (links path)
+  (str (get links :prefix) path))
+
+(defn- shown (address)
+  (if (get address :name)
+    (str (get address :name) " <" (get address :email) ">")
+    (get address :email)))
+
+(defn- shown-all (addresses)
+  (string/join (map (or addresses []) shown) ", "))
+
+(defn- shell (links title body opts)
+  (let (refresh (get opts :refresh-ms))
+    (web/template/render [:html
+                           {:lang "en"}
+                           [:head
+                             {}
+                             [:meta {:charset "utf-8"}]
+                             [:meta
+                               {:name "viewport" :content "width=device-width, initial-scale=1"}]
+                             [:meta {:name "robots" :content "noindex, nofollow"}]
+                             [:title {} title]
+                             [:style {} (web/template/raw *styles*)]]
+                           [:body
+                             {}
+                             [:div
+                               {:class "wrap"}
+                               [:h1 {} [:a {:href (href links "")} title]]
+                               body
+                               [:footer
+                                 {}
+                                 "Every email this process's mail/local adapter was handed, newest first. In memory; a restart forgets."
+                                 (if refresh
+                                   (str " Refreshes every " (math/quot refresh 1000) "s.")
+                                   "")]
+                               (if refresh (web/dashboard/refresh-script refresh) "")]]])))
+
+(defn- inbox (links state)
+  (let (entries (emails-of state))
+    (if (empty? entries)
+      [:p {:class "dim"} "No email yet."]
+      [:table
+        {}
+        [:thead {} [:tr {} [:th {} "when"] [:th {} "from"] [:th {} "to"] [:th {} "subject"]]]
+        [:tbody
+          {}
+          (map entries
+            (fn (entry)
+              [:tr
+                {}
+                [:td {:class "n"} (when-at (get entry :at))]
+                [:td {} (shown (get entry :from))]
+                [:td {} (shown-all (get entry :to))]
+                [:td
+                  {}
+                  [:a
+                    {:href (href links (str "/" (get entry :id)))}
+                    (let (subject (get entry :subject ""))
+                      (if (= subject "") "(no subject)" subject))]
+                  (let (n (count (get entry :attachments [])))
+                    (if (> n 0) [:span {:class "tag"} (str n " attached")] ""))]]))]])))
+
+(defn- row (label value)
+  (if (or (nil? value) (= value ""))
+    ""
+    [:tr {} [:th {:class "k"} label] [:td {} value]]))
+
+(defn- attachment-rows (links id attachments)
+  (map (seq/zip (range (count attachments)) attachments)
+    (fn (pair)
+      (let (index (first pair) att (second pair))
+        [:tr
+          {}
+          [:td
+            {}
+            [:a
+              {:href (href links (str "/" id "/attachments/" index))}
+              (get att :filename)]
+            (if (= (get att :disposition) :inline)
+              [:span {:class "tag"} (str "inline cid:" (get att :cid))]
+              "")]
+          [:td {} (get att :content-type)]
+          [:td {:class "n"} (str (count (get att :data)) " bytes")]]))))
+
+(defn- one (links entry)
+  (let (id (get entry :id)
+        attachments (get entry :attachments []))
+    [:div
+      {}
+      [:table
+        {}
+        [:tbody
+          {}
+          (row "From" (shown (get entry :from)))
+          (row "To" (shown-all (get entry :to)))
+          (row "Cc" (shown-all (get entry :cc)))
+          (row "Bcc" (shown-all (get entry :bcc)))
+          (row "Reply-To" (and (get entry :reply-to) (shown (get entry :reply-to))))
+          (row "Subject" (get entry :subject))
+          (row "Date" (when-at (get entry :at)))
+          (map (get entry :headers {}) (fn (pair) (row (first pair) (second pair))))]]
+      (if (get entry :html)
+        [:div
+          {}
+          [:h2 {} "HTML"]
+          [:iframe {:src (href links (str "/" id "/html")) :sandbox "" :title "HTML body"}]]
+        "")
+      (if (get entry :text) [:div {} [:h2 {} "Text"] [:pre {} (get entry :text)]] "")
+      (if (empty? attachments)
+        ""
+        [:div
+          {}
+          [:h2 {} "Attachments"]
+          [:table {} [:tbody {} (attachment-rows links id attachments)]]])
+      (if (empty? (get entry :provider-options {}))
+        ""
+        [:div {} [:h2 {} "Provider options"] [:pre {} (pr-str (get entry :provider-options))]])]))
+
+(defn- parse-id (text)
+  (let (n (string/->number (or text "")))
+    (if (int? n) n nil)))
+
+(defn page (path &optional (opts {}))
+  "The page for `path` — `\"\"` (the inbox) or `\"<id>\"` (one email) — as an HTML string,
+  from a snapshot of this process. `opts`: `:prefix` (where the handler is mounted, default
+  `\"/mailbox\"`), `:title`, `:refresh-ms` (the inbox keeps itself current), `:state` (a
+  snapshot, for a test). Nil for a path that is no page."
+  (let (links {:prefix (get opts :prefix "/mailbox")}
+        title (get opts :title "mailbox")
+        state (or (get opts :state) (snapshot))
+        parts (seq/filter (string/split path "/") (fn (s) (not (= s ""))))
+        id (parse-id (first parts)))
+    (cond
+      (empty? parts) (shell links title (inbox links state) opts)
+      (and id (= (count parts) 1))
+        (let (entry (email-of state id))
+          (shell links
+            (str title " · #" id)
+            (if entry (one links entry) [:p {:class "dim"} (str "No email #" id ".")])
+            ;; one email is a still page; only the inbox refreshes
+            (dissoc opts :refresh-ms)))
+      :else nil)))
+
+(defn resource (path &optional (opts {}))
+  "The raw resource for `path` — `\"<id>/html\"` (the HTML body, for the page's iframe) or
+  `\"<id>/attachments/<index>\"` (the attachment's bytes, as a download) — as
+  `{:content-type :body :headers}`, or nil for a path that is no resource, an unknown id,
+  or an email without that part. `opts` `:state` as for `page`."
+  (let (state (or (get opts :state) (snapshot))
+        parts (seq/filter (string/split path "/") (fn (s) (not (= s ""))))
+        entry (email-of state (parse-id (first parts)))
+        kind (second parts))
+    (cond
+      (nil? entry) nil
+      (and (= kind "html") (= (count parts) 2) (get entry :html))
+        {:content-type "text/html; charset=utf-8"
+         :body (get entry :html)
+         :headers {:content-security-policy "sandbox"}}
+      (and (= kind "attachments") (= (count parts) 3))
+        (let (index (parse-id (nth parts 2))
+              attachments (get entry :attachments []))
+          (if (and index (>= index 0) (< index (count attachments)))
+            (let (att (nth attachments index))
+              {:content-type (get att :content-type)
+               :body (get att :data)
+               :headers {:content-disposition (str "attachment; filename=\""
+                                                (get att :filename)
+                                                "\"")}})
+            nil))
+      :else nil)))
+
+(defn handler (&optional (opts {}))
+  "A conn handler serving the mailbox. Mount it twice — on the prefix and on
+  `<prefix>/*path` — behind whatever guards the operational pages; `opts` as for `page`,
+  with `:prefix` naming where it is mounted."
+  (fn (conn)
+    (let (path (or (web/conn/param conn "path") "")
+          raw (resource path opts))
+      (cond
+        raw
+          (-> (fold (get raw :headers {})
+                conn
+                (fn (c pair) (web/conn/put-resp-header c (first pair) (second pair))))
+            (web/conn/put-resp-header :cache-control "no-store")
+            (web/conn/put-resp-header :content-type (get raw :content-type))
+            (web/conn/send-resp 200 (get raw :body)))
+        :else
+          (let (html (page path opts))
+            (if (nil? html)
+              (web/conn/not-found-resp conn)
+              (-> conn
+                (web/conn/put-resp-header :cache-control "no-store")
+                (web/conn/put-resp-header :content-type "text/html; charset=utf-8")
+                (web/conn/send-resp 200 html))))))))

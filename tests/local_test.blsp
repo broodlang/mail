@@ -1,0 +1,107 @@
+;; The mailbox folds (pure), the keeper through the adapter, and the pages and resources
+;; from a snapshot handed in.
+(defmodule mail-local-test
+  (:use test)
+  (:use mail/local)
+  (:alias mail))
+
+(defn- an-email (subject)
+  (-> (mail/new)
+    (mail/from "Hive <noreply@brood.fly.dev>")
+    (mail/to "ada@x.io")
+    (mail/cc ["Bob" "bob@x.io"])
+    (mail/subject subject)
+    (mail/text-body "hello <there>")
+    (mail/html-body "<p>hello <b>there</b></p>")
+    (mail/header "X-Campaign" "welcome")
+    (mail/attachment {:filename "a.txt" :data "hi there"})))
+
+(defn- state ()
+  (-> (empty-state)
+    (add-email (an-email "First") 1700000000000)
+    (add-email (an-email "Second") 1700000060000)))
+
+(describe "the mailbox (pure)"
+  (test "entries are stamped and read back newest first"
+    (let (s (state))
+      (assert= [2 1] (vec (map (emails-of s) (fn (e) (get e :id)))))
+      (assert= "Second" (get (first (emails-of s)) :subject))
+      (assert= 1700000000000 (get (email-of s 1) :at))
+      (assert= nil (email-of s 3))))
+
+  (test "the mailbox is bounded and the oldest goes first"
+    (let (full (fold (range 0 (+ *max-emails* 5))
+                 (empty-state)
+                 (fn (s i) (add-email s (mail/subject (mail/new) (str i)) i))))
+      (assert= *max-emails* (count (get full :emails)))
+      (assert= "5" (get (first (get full :emails)) :subject))
+      (assert= (+ *max-emails* 6) (get full :next-id)))))
+
+(describe "the adapter"
+  :serial (test "delivers into the keeper and answers the entry's id"
+    (stop)
+    (let (mailer (adapter))
+      (assert= [:ok {:id 1}] (mail/deliver (an-email "A") mailer))
+      (assert= [:ok {:id 2}] (mail/deliver (an-email "B") mailer))
+      (assert= ["B" "A"] (vec (map (emails) (fn (e) (get e :subject)))))
+      (assert= "A" (get (email 1) :subject))
+      (clear)
+      (assert= [] (emails))
+      (stop)
+      (assert= nil (pid))
+      (assert= [] (emails)))))
+
+(describe "pages"
+  (test "the inbox lists every email, newest first, with a link to each"
+    (let (html (page "" {:state (state)}))
+      (is (includes? html "Second"))
+      (is (includes? html "href=\"/mailbox/2\""))
+      (is (includes? html "Hive &lt;noreply@brood.fly.dev&gt;"))
+      (is (< (index-of html "Second") (index-of html "First")))
+      (is (includes? html "1 attached"))))
+
+  (test "an empty inbox says so"
+    (is (includes? (page "" {:state (empty-state)}) "No email yet")))
+
+  (test "one email shows its headers, bodies and attachments — the HTML via the iframe"
+    (let (html (page "1" {:state (state)}))
+      (is (includes? html "Bob &lt;bob@x.io&gt;"))
+      (is (includes? html "X-Campaign"))
+      (is (includes? html "src=\"/mailbox/1/html\""))
+      (is (includes? html "sandbox=\"\""))
+      (is (not (includes? html "<p>hello <b>there</b></p>")))
+      (is (includes? html "hello &lt;there&gt;"))
+      (is (includes? html "href=\"/mailbox/1/attachments/0\""))
+      (is (includes? html "8 bytes"))))
+
+  (test "an unknown id is a page saying so; a non-page path is nil"
+    (is (includes? (page "9" {:state (state)}) "No email #9"))
+    (assert= nil (page "nope" {:state (state)}))
+    (assert= nil (page "1/2/3" {:state (state)})))
+
+  (test "the prefix is honoured in every link"
+    (is (includes? (page "" {:state (state) :prefix "/dev/mail"}) "href=\"/dev/mail/2\"")))
+
+  (test "the inbox refreshes with :refresh-ms; one email never does"
+    (is (includes? (page "" {:state (state) :refresh-ms 4000}) "<script"))
+    (is (not (includes? (page "1" {:state (state) :refresh-ms 4000}) "<script")))))
+
+(describe "resources"
+  (test "the HTML body, sandboxed by header"
+    (let (r (resource "1/html" {:state (state)}))
+      (assert= "text/html; charset=utf-8" (get r :content-type))
+      (assert= "<p>hello <b>there</b></p>" (get r :body))
+      (assert= "sandbox" (get (get r :headers) :content-security-policy))))
+
+  (test "an attachment downloads under its name"
+    (let (r (resource "1/attachments/0" {:state (state)}))
+      (assert= "text/plain" (get r :content-type))
+      (assert= "hi there" (get r :body))
+      (assert= "attachment; filename=\"a.txt\"" (get (get r :headers) :content-disposition))))
+
+  (test "nothing for an unknown id, index or kind"
+    (assert= nil (resource "9/html" {:state (state)}))
+    (assert= nil (resource "1/attachments/4" {:state (state)}))
+    (assert= nil (resource "1/attachments/x" {:state (state)}))
+    (assert= nil (resource "1/text" {:state (state)}))
+    (assert= nil (resource "" {:state (state)}))))

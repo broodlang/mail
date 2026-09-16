@@ -1,0 +1,141 @@
+;; The request Mailjet receives and the reading of its answers, against a transport that
+;; records and replies from a script. No network.
+(defmodule mail-mailjet-test
+  (:use test)
+  (:use mail/mailjet)
+  (:alias mail)
+  (:alias json)
+  (:alias encoding))
+
+;; A transport that hands back `resp` and remembers the one request it was given, by
+;; sending it to the test process — a test then `receive`s exactly its own request.
+(defn- replying (resp)
+  (let (me (self))
+    (fn (address body headers)
+      (send me [:request address body headers])
+      resp)))
+
+(defn- response (status body)
+  {:status status :headers {} :body (string/->bytes body)})
+
+(defn- adapter-with (resp & opts)
+  (adapter (merge {:api-key "K" :secret-key "S" :transport (replying resp)} (apply hash-map opts))))
+
+(defn- success-body ()
+  (json/encode {"Messages" [{"Status" "success"
+                             "To" [{"Email" "ada@x.io"
+                                    "MessageUUID" "uuid-1"
+                                    "MessageID" 1234
+                                    "MessageHref" "https://api.mailjet.com/v3/REST/message/1234"}]}]}))
+
+(defn- ready ()
+  (-> (mail/new)
+    (mail/from "Hive <noreply@brood.fly.dev>")
+    (mail/to "ada@x.io")
+    (mail/subject "Hi")
+    (mail/text-body "hello")))
+
+(defn- sent-request ()
+  (receive
+    ([:request address body headers] [address (json/decode body) headers])
+    (after 1000 (error "the transport was not called"))))
+
+(describe "the request"
+  (test "URL, Basic auth and the one-message body"
+    (let (outcome (mail/deliver (ready) (adapter-with (response 200 (success-body))))
+          sent (sent-request)
+          address (nth sent 0)
+          body (nth sent 1)
+          headers (nth sent 2))
+      (assert= [:ok {:id 1234 :uuid "uuid-1" :href "https://api.mailjet.com/v3/REST/message/1234"}]
+        outcome)
+      (assert= "https://api.mailjet.com/v3.1/send" address)
+      (assert= (str "Basic " (encoding/base64-encode "K:S")) (get headers "Authorization"))
+      (assert= "application/json" (get headers "Content-Type"))
+      (assert= 1 (count (get body :Messages)))
+      (assert= nil (get body :SandboxMode))
+      (let (message (first (get body :Messages)))
+        (assert= {:Email "noreply@brood.fly.dev" :Name "Hive"} (get message :From))
+        (assert= [{:Email "ada@x.io"}] (get message :To))
+        (assert= "Hi" (get message :Subject))
+        (assert= "hello" (get message :TextPart))
+        (assert= nil (get message :HTMLPart))
+        (assert= nil (get message :Cc))
+        (assert= nil (get message :Headers))
+        (assert= nil (get message :Attachments)))))
+
+  (test "every field the email can carry, in Mailjet's names"
+    (let (email (-> (ready)
+                  (mail/cc ["Bob" "bob@x.io"])
+                  (mail/bcc "eve@x.io")
+                  (mail/reply-to "help@x.io")
+                  (mail/html-body "<p>hello</p>")
+                  (mail/header "X-Campaign" "welcome")
+                  (mail/attachment {:filename "a.txt" :data "hi"})
+                  (mail/attachment {:filename "logo.png"
+                                    :data #b"\x89PNG"
+                                    :disposition :inline
+                                    :cid "logo"})
+                  (mail/provider-option :template-id 12)
+                  (mail/provider-option :variables {"name" "Ada"})
+                  (mail/provider-option :mailjet {"Priority" 2}))
+          message (message email))
+      (assert= [{"Email" "bob@x.io" "Name" "Bob"}] (get message "Cc"))
+      (assert= [{"Email" "eve@x.io"}] (get message "Bcc"))
+      (assert= {"Email" "help@x.io"} (get message "ReplyTo"))
+      (assert= "<p>hello</p>" (get message "HTMLPart"))
+      (assert= {"X-Campaign" "welcome"} (get message "Headers"))
+      (assert= [{"ContentType" "text/plain" "Filename" "a.txt" "Base64Content" "aGk="}]
+        (get message "Attachments"))
+      (assert= [{"ContentType" "image/png"
+                 "Filename" "logo.png"
+                 "Base64Content" (encoding/base64-encode-bytes #b"\x89PNG")
+                 "ContentID" "logo"}]
+        (get message "InlinedAttachments"))
+      (assert= 12 (get message "TemplateID"))
+      (assert= {"name" "Ada"} (get message "Variables"))
+      (assert= 2 (get message "Priority"))))
+
+  (test "sandbox mode from the adapter or the email"
+    (assert= true
+      (get (request (adapter {:api-key "K" :secret-key "S" :sandbox? true}) (ready)) "SandboxMode"))
+    (assert= true
+      (get (request (adapter {:api-key "K" :secret-key "S"})
+             (mail/provider-option (ready) :sandbox? true))
+        "SandboxMode"))
+    (assert= nil (get (request (adapter {:api-key "K" :secret-key "S"}) (ready)) "SandboxMode")))
+
+  (test "an adapter without keys is refused at construction"
+    (is (includes? (error-message (try (adapter {:api-key "K"}) (catch e e)))
+          "mail/mailjet/adapter"))))
+
+(describe "the answer"
+  (test "a 400 carries Mailjet's own error, naming the field"
+    (let (body (json/encode {"Messages" [{"Status" "error"
+                                          "Errors" [{"ErrorCode" "mj-0004"
+                                                     "StatusCode" 400
+                                                     "ErrorMessage" "Type mismatch. Expected type \"string\"."
+                                                     "ErrorRelatedTo" ["HTMLPart"]}]}]}))
+      (assert= [:error
+                 "mail/mailjet: 400 mj-0004 HTMLPart: Type mismatch. Expected type \"string\"."]
+        (mail/deliver (ready) (adapter-with (response 400 body))))))
+
+  (test "a 401 has no Messages, only a flat ErrorMessage"
+    (let (body (json/encode {"ErrorInfo" ""
+                             "ErrorMessage" "API key authentication/authorization failure."
+                             "StatusCode" 401}))
+      (assert= [:error "mail/mailjet: 401 API key authentication/authorization failure."]
+        (mail/deliver (ready) (adapter-with (response 401 body))))))
+
+  (test "a 200 whose message is not a success is still an error"
+    (let (body (json/encode {"Messages" [{"Status" "error"
+                                          "Errors" [{"ErrorCode" "mj-0001" "ErrorMessage" "nope"}]}]}))
+      (assert= [:error "mail/mailjet: 200 mj-0001: nope"]
+        (mail/deliver (ready) (adapter-with (response 200 body))))))
+
+  (test "no response, and a body that is not JSON"
+    (assert= [:error "mail/mailjet: connection refused"]
+      (mail/deliver (ready)
+        (adapter-with {:status 0 :headers {} :body #b"" :error "connection refused"})))
+    (assert= [:error "mail/mailjet: HTTP 502"]
+      (mail/deliver (ready) (adapter-with (response 502 "<html>bad gateway</html>"))))))

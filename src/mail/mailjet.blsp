@@ -1,0 +1,188 @@
+;; mail/mailjet — Mailjet as a `mail` adapter, over its Send API v3.1.
+;;
+;; One request per email: `POST /v3.1/send` with a `Messages` array of one, authenticated
+;; with the account's API key and secret key as HTTP Basic. This module is that wire format
+;; and the reading of its answer — the builder, validation and the delivery contract are
+;; `mail`'s (this is the built-in vendor adapter; a third-party one is the same shape in its own package).
+;;
+;; The answer is read for what it is, not for its status alone: a 200 carries a per-message
+;; `Status`, and a 400 carries the `Errors` array naming the field Mailjet refused — which
+;; is the message a developer needs, so it is the one `[:error …]` carries. A 401 has a
+;; flat `ErrorMessage` and no `Messages` at all; both shapes are handled.
+(defmodule mail/mailjet
+  "Mailjet as a `mail` adapter.
+
+      (def adapter (mail/mailjet/adapter {:api-key (os/env \"MAILJET_API_KEY\")
+                                          :secret-key (os/env \"MAILJET_SECRET_KEY\")}))
+      (mail/deliver email adapter)   ; → [:ok {:id 1234 :uuid \"…\"}] | [:error \"mail/mailjet: …\"]
+
+  Provider options the adapter reads (`mail/provider-option`): `:template-id`,
+  `:template-language`, `:variables`, `:custom-id`, `:custom-campaign`,
+  `:deduplicate-campaign`, `:event-payload`, `:url-tags`, `:track-opens`, `:track-clicks`,
+  `:priority`, `:sandbox?` — each Mailjet's field of the same name — and `:mailjet`, a map
+  merged into the message as it is, for a field this list does not name."
+  (:use mail :only [Adapter])
+  (:alias http)
+  (:alias json)
+  (:alias encoding)
+  (:alias string))
+
+(def *endpoint* "https://api.mailjet.com")
+
+;; ---- the adapter value --------------------------------------------------------------------
+
+(defrecord mailjet (name endpoint api-key secret-key sandbox? transport))
+
+(defn adapter (opts)
+  "An adapter from `opts`: `:api-key` and `:secret-key` (the account's, from Account
+  settings → API keys), `:sandbox?` (validate every message without sending — default
+  false), `:endpoint` (default Mailjet's), `:transport` (a `(fn (url body headers) ->
+  response)`, default `http/post` — for a test)."
+  (when (or (nil? (get opts :api-key)) (nil? (get opts :secret-key)))
+    (error "mail/mailjet/adapter: needs :api-key and :secret-key"))
+  (mailjet "mailjet"
+    (get opts :endpoint *endpoint*)
+    (get opts :api-key)
+    (get opts :secret-key)
+    (get opts :sandbox? false)
+    (get opts :transport http-post)))
+
+(defn- http-post (address body headers)
+  (http/post address body {:headers headers}))
+
+(defn headers (adapter)
+  "The request headers: JSON in, and the two keys as HTTP Basic."
+  {"Content-Type" "application/json"
+   "Authorization" (str "Basic "
+                     (encoding/base64-encode (str (get adapter :api-key)
+                                               ":"
+                                               (get adapter :secret-key))))})
+
+(impl Adapter
+  mailjet
+  (transmit [adapter email]
+    (let (resp ((get adapter :transport) (str (get adapter :endpoint) "/v3.1/send")
+                 (json/encode (request adapter email))
+                 (headers adapter)))
+      (outcome resp))))
+
+;; ---- the request --------------------------------------------------------------------------
+
+(defn recipient (address)
+  "One `{:name :email}` as Mailjet's `{Email Name}`; `Name` is left out when there is none."
+  (let (base {"Email" (get address :email)})
+    (if (get address :name) (assoc base "Name" (get address :name)) base)))
+
+(defn- recipients (addresses)
+  (vec (map addresses recipient)))
+
+(defn- base64 (data)
+  (if (bytes? data) (encoding/base64-encode-bytes data) (encoding/base64-encode (str data))))
+
+(defn attachment (att)
+  "One attachment as Mailjet's `{ContentType Filename Base64Content}`, plus `ContentID`
+  for an inline one."
+  (let (base {"ContentType" (get att :content-type)
+              "Filename" (get att :filename)
+              "Base64Content" (base64 (get att :data))})
+    (if (get att :cid) (assoc base "ContentID" (get att :cid)) base)))
+
+(defn- inline? (att) (= (get att :disposition) :inline))
+
+;; Each provider option and the Mailjet field it becomes.
+(def *option-fields*
+  [[:template-id "TemplateID"]
+    [:template-language "TemplateLanguage"]
+    [:variables "Variables"]
+    [:custom-id "CustomID"]
+    [:custom-campaign "CustomCampaign"]
+    [:deduplicate-campaign "DeduplicateCampaign"]
+    [:event-payload "EventPayload"]
+    [:url-tags "URLTags"]
+    [:track-opens "TrackOpens"]
+    [:track-clicks "TrackClicks"]
+    [:priority "Priority"]])
+
+(defn- with-options (message options)
+  (let (named (fold *option-fields*
+                message
+                (fn (acc pair)
+                  (let (key (first pair) field (second pair))
+                    (if (contains? options key) (assoc acc field (get options key)) acc)))))
+    (merge named (get options :mailjet {}))))
+
+(defn- with-optional (message field value)
+  (if (nil? value) message (assoc message field value)))
+
+(defn- with-present (message field values)
+  (if (empty? values) message (assoc message field values)))
+
+(defn message (email)
+  "The email as one entry of Mailjet's `Messages` array. Fields with nothing in them are
+  left out rather than sent empty — Mailjet rejects an empty `HTMLPart` where it accepts
+  an absent one."
+  (let (options (get email :provider-options {})
+        attachments (get email :attachments []))
+    (-> {"From" (recipient (get email :from))
+         "To" (recipients (get email :to []))
+         "Subject" (get email :subject "")}
+      (with-present "Cc" (recipients (get email :cc [])))
+      (with-present "Bcc" (recipients (get email :bcc [])))
+      (with-optional "ReplyTo" (and (get email :reply-to) (recipient (get email :reply-to))))
+      (with-optional "TextPart" (get email :text))
+      (with-optional "HTMLPart" (get email :html))
+      (with-present "Headers" (get email :headers {}))
+      (with-present "Attachments"
+        (vec (map (seq/filter attachments (fn (att) (not (inline? att)))) attachment)))
+      (with-present "InlinedAttachments" (vec (map (seq/filter attachments inline?) attachment)))
+      (with-options options))))
+
+(defn request (adapter email)
+  "The whole request body: one message, and `SandboxMode` when the adapter or the email's
+  `:sandbox?` option asks for it."
+  (let (sandbox (or (get adapter :sandbox?) (get (get email :provider-options {}) :sandbox?)))
+    (if sandbox
+      {"Messages" [(message email)] "SandboxMode" true}
+      {"Messages" [(message email)]})))
+
+;; ---- the answer ---------------------------------------------------------------------------
+
+(defn- body-json (resp)
+  ;; check-allow :discarded-catch — a body that is not JSON is the negative answer
+  (check-allow :discarded-catch (try (json/decode (http/body-text resp)) (catch _ nil))))
+
+(defn- first-message (parsed)
+  (and (map? parsed) (first (get parsed :Messages))))
+
+(defn- errors-text (message)
+  (string/join (map (get message :Errors [])
+                 (fn (e)
+                   (str (get e :ErrorCode "")
+                     (if (empty? (get e :ErrorRelatedTo []))
+                       ""
+                       (str " " (string/join (get e :ErrorRelatedTo) ",")))
+                     ": "
+                     (get e :ErrorMessage ""))))
+    "; "))
+
+(defn outcome (resp)
+  "A response as the delivery contract's answer. A 2xx whose message `Status` is
+  `\"success\"` is `[:ok {:id :uuid :href}]` from the first recipient's receipt; anything
+  else is `[:error message]` carrying Mailjet's own error text — the `Errors` of the
+  message when there is one, the flat `ErrorMessage` of a 401 otherwise."
+  (let (status (get resp :status 0)
+        parsed (body-json resp)
+        message (first-message parsed))
+    (cond
+      (= status 0) [:error (str "mail/mailjet: " (get resp :error "no response"))]
+      (and (>= status 200) (< status 300) (map? message) (= (get message :Status) "success"))
+        (let (receipt (or (first (get message :To)) {}))
+          [:ok
+            {:id (get receipt :MessageID)
+             :uuid (get receipt :MessageUUID)
+             :href (get receipt :MessageHref)}])
+      (and (map? message) (not (empty? (get message :Errors []))))
+        [:error (str "mail/mailjet: " status " " (errors-text message))]
+      (and (map? parsed) (get parsed :ErrorMessage))
+        [:error (str "mail/mailjet: " status " " (get parsed :ErrorMessage))]
+      :else [:error (str "mail/mailjet: HTTP " status)])))
