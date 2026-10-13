@@ -12,8 +12,10 @@ Swoosh's shape for Brood: an email is a plain map, builders return new ones, and
 - **`deliver` never raises.** `[:ok result]` / `[:error message]`, a raise in the adapter
   included. Validation runs before the adapter so no adapter checks for a sender.
 - The ability op is `transmit`, not `deliver` — both would be `mail/deliver` in this
-  namespace. An `impl` in another module must name the ability bare
-  (`(:use mail :only [Adapter])`); qualified, it registers under a name dispatch never sees.
+  namespace. An `impl` in another module must name the ability bare (`(impl Adapter …)`);
+  qualified, it registers under a name dispatch never sees. Ability names are not module
+  globals, so there is nothing to import: `(:load mail)` (or an `(:alias mail)`) is enough —
+  `(:use mail :only [Adapter])` refers nothing, and `nest check` says so.
 - `mail/local`: the HTML body is never inlined into the page — the iframe loads
   `<id>/html`, sandboxed by attribute and by CSP header. `stop` unregisters the name
   BEFORE the asynchronous `gen/stop`, so `pid` is nil on return; its adapter test is

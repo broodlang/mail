@@ -29,7 +29,6 @@
 
   `(mail/local/adapter)` starts the keeper (registered `:mail/local`) if it is not
   running; `clear` empties it; `stop` ends it."
-  (:use mail :only [Adapter])
   (:alias mail)
   (:alias gen)
   (:alias proc)

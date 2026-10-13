@@ -3,9 +3,6 @@
 (defmodule mail-test
   (:use test)
   (:alias mail)
-  ;; the ability an `impl` names must be visible bare — qualified, it registers under a
-  ;; name `mail/deliver` never dispatches on
-  (:use mail :only [Adapter])
   (:alias telemetry))
 
 (defn- ready ()

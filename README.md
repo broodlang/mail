@@ -103,7 +103,7 @@ The answer is read for what it is: a 400's `Errors` naming the field refused is 
 ## Writing an adapter
 
 ```lisp
-(defmodule mail-postmark (:use mail :only [Adapter]))   ; the ability, named bare
+(defmodule mail-postmark (:load mail))   ; ability names are global: `impl` names it bare
 
 (defrecord postmark (name token))
 

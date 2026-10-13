@@ -21,7 +21,7 @@
   `:deduplicate-campaign`, `:event-payload`, `:url-tags`, `:track-opens`, `:track-clicks`,
   `:priority`, `:sandbox?` — each Mailjet's field of the same name — and `:mailjet`, a map
   merged into the message as it is, for a field this list does not name."
-  (:use mail :only [Adapter])
+  (:load mail)
   (:alias http)
   (:alias json)
   (:alias encoding)
