@@ -4,7 +4,7 @@
 (project
   :name "mail"
   :version "0.2.0"
-  :brood ">= 0.38.0"
+  :brood ">= 0.40.0"
   :description
     "Compose an email and deliver it through a swappable adapter — Swoosh, for Brood. Builder, validation, telemetry; a local mailbox with a preview page and a Mailjet adapter built in; any vendor pluggable through the Adapter ability."
   :repository "https://github.com/broodlang/mail"
