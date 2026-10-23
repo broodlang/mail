@@ -59,6 +59,27 @@ Every delivery emits `[:mail :deliver :stop]` (or `:exception`) through `telemet
 `:duration` and `{:adapter :recipients :subject :result}`, so a monitoring package such as
 [observe](https://github.com/broodlang/observe) sees every send with no instrumentation.
 
+## An app's outbox — `mail/outbox`
+
+What every Hatch app that signs people up ends up writing: the adapter chosen once at boot
+from the environment (Mailjet when `$MAILJET_API_KEY` + `$MAILJET_SECRET_KEY` are set, the
+local mailbox in dev, the log otherwise), the sender, the base URL every emailed link is
+built on (never the request's `Host`), the confirmation and password-reset emails
+`web/accounts` tokens travel in, and delivery off the request path.
+
+```brood
+(def *options* {:product "Acme"
+                :about "the widget shop"
+                :site-url "https://acme.example"
+                :base-url-variable "ACME_BASE_URL"
+                :from-address "no-reply@acme.example"})
+
+(mail/outbox/preset *options*)        ; at load: the log adapter, links on :site-url
+(mail/outbox/start *options*)         ; a boot child: the environment's choice
+(mail/outbox/deliver-later
+  (mail/outbox/confirmation-email user (mail/outbox/url (str "/confirm/" raw))))
+```
+
 ## The mailbox — `mail/local`
 
 ```lisp

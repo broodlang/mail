@@ -1,0 +1,262 @@
+(defmodule mail/outbox
+  "An app's outgoing mail: the adapter chosen once at boot from the environment, the sender,
+  the URL every emailed link is built on, and the account emails a hatch app sends (a
+  confirmation link after registering, a reset link when a password is forgotten).
+
+      (mail/outbox/start {:product \"Acme\"
+                          :about \"the widget shop\"
+                          :site-url \"https://acme.example\"
+                          :base-url-variable \"ACME_BASE_URL\"
+                          :from-address \"no-reply@acme.example\"})
+      (mail/outbox/deliver-later
+        (mail/outbox/confirmation-email user (mail/outbox/url (str \"/confirm/\" raw))))
+
+  The adapter, from the environment:
+
+  - **Mailjet, when keyed.** `$MAILJET_API_KEY` + `$MAILJET_SECRET_KEY`, sending from
+    `$MAIL_FROM_ADDRESS` (`$MAIL_FROM_NAME`), which must be an address on a domain the
+    account has verified — Mailjet refuses the rest.
+  - **The local mailbox, in dev.** Every email is kept in-process and read at the app's
+    `mail/local/handler` mount, so the whole flow — register, open the mail, follow the link
+    — runs on a laptop with nothing configured and nothing sent.
+  - **The log, otherwise.** A production deploy without keys logs one line per email and
+    sends nothing, and says so at boot. Registration still works; the confirmation simply
+    never arrives, which is the honest degradation.
+
+  Links are built on the base URL (`$<base-url-variable>`, else `:site-url` in prod, else the
+  dev server), never on the request's `Host` header — a reset link built from a header the
+  sender controls is a reset link that points wherever the sender says.
+
+  `deliver-later` sends off the request path: a vendor round trip is a few hundred
+  milliseconds the person submitting the form should not wait for, and its failure is a log
+  line for the operator rather than an error for someone who was told to check their inbox."
+  (:alias mail)
+  (:alias mail/local)
+  (:alias mail/mailjet)
+  (:alias web/env)
+  (:alias web/template)
+  (:alias log))
+
+;; ---- settings -----------------------------------------------------------------
+
+(def- *option-keys* [:product :about :site-url :base-url-variable :from-name :from-address])
+
+(defn- option (options key)
+  (or (get options key) (error "mail/outbox: missing option " key)))
+
+(defn variables (options)
+  "Every environment variable `settings` reads for `options`."
+  ["MAILJET_API_KEY"
+    "MAILJET_SECRET_KEY"
+    "MAIL_FROM_ADDRESS"
+    "MAIL_FROM_NAME"
+    (option options :base-url-variable)
+    "HATCH_ENV"
+    "HATCH_PORT"])
+
+(defn settings (env options)
+  "The mail settings from an environment map (`var → value`) and the app's `options`
+  (`:product`, `:about`, `:site-url`, `:base-url-variable`, `:from-address`, and
+  `:from-name`, which defaults to `:product`). An unknown or missing option is refused. Always
+  a map:
+
+  - `:transport` — `:mailjet` when both keys are set and not blank (a blank is what a
+    deploy tool writes for a secret it could not find, and it must read as \"off\"),
+    `:local` in dev, `:log` otherwise.
+  - `:mailjet` — `{:api-key :secret-key}`, nil unless the transport is Mailjet.
+  - `:from` — `{:name :email}`, from `$MAIL_FROM_NAME` / `$MAIL_FROM_ADDRESS`, else the
+    options' defaults (`:default-from` keeps those, so `start` can warn about it).
+  - `:base-url` — what links are built on: `$<base-url-variable>`, else `:site-url` in
+    prod, else `http://localhost:<port>` so a link in the dev mailbox opens the dev server.
+  - `:product`, `:about`, `:site-url` — what the messages say."
+  (let (unknown (seq/filter (keys options) (fn (key) (not (includes? *option-keys* key))))
+        api-key (web/env/as-text (get env "MAILJET_API_KEY"))
+        secret-key (web/env/as-text (get env "MAILJET_SECRET_KEY"))
+        dev? (= (web/env/as-text (get env "HATCH_ENV") web/env/*dev-name*) web/env/*dev-name*)
+        port (web/env/as-positive-integer (get env "HATCH_PORT") 5000)
+        default-from {:name (or (get options :from-name) (option options :product))
+                      :email (option options :from-address)})
+    (when (not (empty? unknown))
+      (error "mail/outbox: unknown option " (first unknown)))
+    {:transport (cond
+                  (and api-key secret-key) :mailjet
+                  dev? :local
+                  :else :log)
+     :mailjet (when (and api-key secret-key) {:api-key api-key :secret-key secret-key})
+     :from {:name (web/env/as-text (get env "MAIL_FROM_NAME") (get default-from :name))
+            :email (web/env/as-text (get env "MAIL_FROM_ADDRESS") (get default-from :email))}
+     :default-from default-from
+     :base-url (without-trailing-slash (web/env/as-text (get env
+                                                          (option options :base-url-variable))
+                                         (if dev?
+                                           (str "http://localhost:" port)
+                                           (option options :site-url))))
+     :product (option options :product)
+     :about (option options :about)
+     :site-url (option options :site-url)}))
+
+;; `https://example.org/` is how a base URL gets typed, and `(str base "/confirm/…")` on
+;; it is a `//confirm/…` the router does not match — every emailed link would 404.
+(defn- without-trailing-slash (url)
+  (if (string/ends-with? url "/") (string/substring url 0 (- (string/length url) 1)) url))
+
+(defn adapter-for (config)
+  "The adapter `config`'s `:transport` names."
+  (case (get config :transport)
+    :mailjet (mail/mailjet/adapter (get config :mailjet))
+    :local (mail/local/adapter)
+    (mail/log-adapter)))
+
+;; ---- the running configuration -------------------------------------------------
+;;
+;; Set once by `start` (or by `configure` in a test), read by everything that sends: the
+;; adapter is a property of the process, not of the request.
+
+(def *settings* nil)
+(def *adapter* nil)
+
+(defn configure (adapter config)
+  "Make `adapter` and `config` (`settings`' map) the ones `deliver` uses — what a test does
+  with a `mail/memory-adapter`, and what `start` does with the environment's choice."
+  (def *adapter* adapter)
+  (def *settings* config)
+  nil)
+
+(defn preset (options)
+  "Configure what the outbox uses until `start` runs: the log adapter, the default sender and
+  links on `:site-url`. Called when the app's mailer module loads, so a test that renders a
+  link, or anything drawn before boot finishes, gets a real URL rather than an error."
+  (configure (mail/log-adapter) (settings {"HATCH_ENV" "prod"} options)))
+
+(defn start (options)
+  "Choose the adapter from the environment for the app's `options` (see `settings`) and say
+  which. A boot child; never raises over the adapter — mail is not a subsystem whose
+  misconfiguration should cost the site, so an adapter that cannot be built is a warning here
+  and the log adapter in its place. `settings` is read outside that guard and kept whichever
+  adapter ends up in use, so a wrong option still fails the boot."
+  (let (config (settings (into {} (map (variables options) (fn (name) [name (os/env name)])))
+                 options))
+    (check-allow :discarded-catch
+      (try
+        (configure (adapter-for config) config)
+        (case (get config :transport)
+          :mailjet
+            (let (from (get (get config :from) :email))
+              (log/info (str "mail: sending through Mailjet as " from))
+              ;; Mailjet refuses a sender on a domain the account has not verified, and
+              ;; the default is on one it cannot verify. The boot would otherwise read as
+              ;; healthy while every send failed one log line at a time.
+              (when (= from (get (get config :default-from) :email))
+                (log/warn (str "mail: MAIL_FROM_ADDRESS is unset — "
+                            from " is not a sender Mailjet will accept; every send will fail"))))
+          :local (log/info "mail: kept in the local mailbox")
+          (log/warn "mail: no MAILJET_API_KEY / MAILJET_SECRET_KEY — email is logged, not sent"))
+        (catch caught
+          (log/warn (str "mail: adapter not built ("
+                      (error-message caught)
+                      ") — email is logged, not sent"))
+          (configure (mail/log-adapter) config)))))
+  nil)
+
+(defn- setting (key)
+  (if (nil? *settings*)
+    (error "mail/outbox: not configured — call mail/outbox/start at boot")
+    (get *settings* key)))
+
+(defn base-url ()
+  "What links are built on, from the running settings."
+  (setting :base-url))
+
+(defn url (path)
+  "An absolute URL for `path` on this deployment."
+  (str (base-url) path))
+
+;; ---- the messages -------------------------------------------------------------
+
+(defn- sender ()
+  (let (from (setting :from))
+    (str (get from :name) " <" (get from :email) ">")))
+
+(defn- html-layout (title & body)
+  "The one HTML shell every message uses: plain, inline-styled, and rendered through
+  `web/template` so a user's address is escaped like any other text."
+  (web/template/render [:div
+                         {:style "font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; font-size: 16px; line-height: 1.5; color: #1f2937; max-width: 36rem;"}
+                         [:h1 {:style "font-size: 20px; margin: 0 0 16px;"} title]
+                         body
+                         [:p
+                           {:style "font-size: 13px; color: #6b7280; margin-top: 32px;"}
+                           (str (setting :product) " — " (setting :about) " at ")
+                           [:a {:href (setting :site-url)} (setting :site-url)]]]))
+
+(defn- link-paragraph (href)
+  [:p {} [:a {:href href :style "word-break: break-all;"} href]])
+
+(defn- account-email (user subject title lines link closing)
+  (-> (mail/new)
+    (mail/from (sender))
+    (mail/to (get user :email))
+    (mail/subject subject)
+    (mail/text-body (str "Hi " (get user :email) ",\n\n" lines "\n\n" link "\n\n" closing "\n"))
+    (mail/html-body (html-layout title
+                      [:p {} "Hi " (get user :email) ","]
+                      [:p {} lines]
+                      (link-paragraph link)
+                      [:p {} closing]))))
+
+(defn confirmation-email (user confirm-url)
+  "The email sent after registering: one link that confirms the address, valid for a week
+  (`web/accounts/*confirm-ttl-ms*`). `confirm-url` is the absolute URL of the confirmation
+  page."
+  (account-email user
+    (str "Confirm your " (setting :product) " account")
+    "Confirm your account"
+    (str "Thanks for registering on "
+      (setting :product)
+      ". Confirm your account by opening this link:")
+    confirm-url
+    "The link is good for seven days. If you didn't create an account, ignore this email."))
+
+(defn reset-password-email (user reset-url)
+  "The email sent when a password reset is asked for: one link that opens the new-password
+  form, valid for a day (`web/accounts/*reset-ttl-ms*`). `reset-url` is the absolute URL of
+  that form."
+  (account-email user
+    (str "Reset your " (setting :product) " password")
+    "Reset your password"
+    (str "Someone asked to reset the password for this "
+      (setting :product)
+      " account. To choose a new one, open this link:")
+    reset-url
+    "The link is good for one day. If you didn't ask for this, ignore this email — your password stays as it is."))
+
+(defn notice-email (address subject paragraphs link)
+  "A short notice to `address`: `paragraphs` of plain text, then `link`, an absolute URL to
+  see more at (a failed check, say)."
+  (-> (mail/new)
+    (mail/from (sender))
+    (mail/to address)
+    (mail/subject subject)
+    (mail/text-body (str (string/join paragraphs "\n\n") "\n\n" link "\n"))
+    (mail/html-body (html-layout subject
+                      (map paragraphs (fn (text) [:p {} text]))
+                      (link-paragraph link)))))
+
+;; ---- delivering -----------------------------------------------------------------
+
+(defn deliver (email)
+  "Deliver `email` through the running adapter, now. `[:ok result]` or `[:error message]`;
+  a failure is also logged, since the person who caused the send is not the one who can
+  fix it."
+  (let (adapter (or *adapter* (mail/log-adapter))
+        outcome (mail/deliver email adapter))
+    (match outcome
+      ([:error message] (log/error (str "mail: " (mail/summary email) " failed: " message)))
+      (_ nil))
+    outcome))
+
+(defn deliver-later (email)
+  "Deliver `email` off the request path. Returns nil at once; the outcome is `deliver`'s
+  log line."
+  (spawn (fn () (deliver email)))
+  nil)

@@ -1,0 +1,154 @@
+;; mail/outbox — the settings parser, pure over an environment map (brood's environment is
+;; read-only, so a reader is tested by not needing one), the account messages, and delivery
+;; against a memory adapter. No network anywhere.
+(defmodule outbox-test
+  (:use test)
+  (:alias mail)
+  (:alias mail/outbox))
+
+(def *options*
+  {:product "Acme"
+   :about "the widget shop"
+   :site-url "https://acme.example"
+   :base-url-variable "ACME_BASE_URL"
+   :from-address "no-reply@acme.example"})
+
+(defn- settings (env) (mail/outbox/settings env *options*))
+
+(describe "mail/outbox/settings"
+  (test "with nothing set on a laptop: the local mailbox, links on localhost"
+    (let (s (settings {}))
+      (assert= :local (get s :transport))
+      (assert= nil (get s :mailjet))
+      (assert= "http://localhost:5000" (get s :base-url))
+      (assert= {:name "Acme" :email "no-reply@acme.example"} (get s :from))))
+
+  (test "the dev port follows HATCH_PORT"
+    (assert= "http://localhost:4001" (get (settings {"HATCH_PORT" "4001"}) :base-url)))
+
+  (test "in prod without keys: the log, links on the canonical site"
+    (let (s (settings {"HATCH_ENV" "prod"}))
+      (assert= :log (get s :transport))
+      (assert= "https://acme.example" (get s :base-url))))
+
+  (test "both keys make it Mailjet, in any environment"
+    (let (s (settings {"MAILJET_API_KEY" "K" "MAILJET_SECRET_KEY" "S"}))
+      (assert= :mailjet (get s :transport))
+      (assert= {:api-key "K" :secret-key "S"} (get s :mailjet))))
+
+  (test "one key is not Mailjet, and a blank key is unset"
+    (assert= :log (get (settings {"MAILJET_API_KEY" "K" "HATCH_ENV" "prod"}) :transport))
+    (assert= :log
+      (get (settings {"MAILJET_API_KEY" "K" "MAILJET_SECRET_KEY" " " "HATCH_ENV" "prod"})
+        :transport)))
+
+  (test "the sender and the base URL are the deployment's"
+    (let (s (settings {"MAIL_FROM_NAME" "Shop"
+                       "MAIL_FROM_ADDRESS" "hello@example.org"
+                       "ACME_BASE_URL" "https://staging.example.org"
+                       "HATCH_ENV" "prod"}))
+      (assert= {:name "Shop" :email "hello@example.org"} (get s :from))
+      (assert= "https://staging.example.org" (get s :base-url))))
+
+  (test "a trailing slash on the base URL is dropped, so links route"
+    (assert= "https://staging.example.org"
+      (get (settings {"ACME_BASE_URL" "https://staging.example.org/"}) :base-url)))
+
+  (test "an unknown option, or a missing one, is refused"
+    (is (includes? (try
+                     (mail/outbox/settings {} (assoc *options* :site :x))
+                     (catch e (error-message e)))
+          "unknown option"))
+    (is (includes? (try
+                     (mail/outbox/settings {} (dissoc *options* :site-url))
+                     (catch e (error-message e)))
+          "missing option")))
+
+  (test "every variable settings reads is one start collects"
+    (for (var ["MAILJET_API_KEY"
+                "MAILJET_SECRET_KEY" "MAIL_FROM_ADDRESS" "MAIL_FROM_NAME" "ACME_BASE_URL"
+                "HATCH_ENV" "HATCH_PORT"])
+      (is (includes? (mail/outbox/variables *options*) var)))))
+
+(describe "mail/outbox/adapter-for"
+  (test "each transport builds its adapter"
+    (assert= "log" (get (mail/outbox/adapter-for (settings {"HATCH_ENV" "prod"})) :name))
+    (assert= "mailjet"
+      (get (mail/outbox/adapter-for (settings {"MAILJET_API_KEY" "K" "MAILJET_SECRET_KEY" "S"}))
+        :name))))
+
+(def *user* {:id 7 :email "ada@example.com"})
+
+;; One SERIAL group for everything that sets the running configuration: the tests in a
+;; file run concurrently, and two of them handing `configure` different adapters is a
+;; race one of them loses (it did, by nulling the adapter mid-delivery).
+(describe "the messages, the URL and delivery"
+  :serial (test "the confirmation email carries the link in both bodies, and names the product"
+    (mail/outbox/preset *options*)
+    (let (email (mail/outbox/confirmation-email *user* "https://acme.example/confirm/abc"))
+      (assert= [{:name nil :email "ada@example.com"}] (get email :to))
+      (assert= "Confirm your Acme account" (get email :subject))
+      (is (includes? (get email :text) "https://acme.example/confirm/abc"))
+      (is (includes? (get email :html) "href=\"https://acme.example/confirm/abc\""))
+      (is (includes? (get email :html) "Acme — the widget shop at "))
+      (assert= :ok (mail/validate email))))
+
+  (test "the reset email likewise, and says what to do if it was not asked for"
+    (mail/outbox/preset *options*)
+    (let (email (mail/outbox/reset-password-email *user* "https://acme.example/reset-password/xyz"))
+      (assert= "Reset your Acme password" (get email :subject))
+      (is (includes? (get email :text) "https://acme.example/reset-password/xyz"))
+      (is (includes? (get email :html) "href=\"https://acme.example/reset-password/xyz\""))
+      (is (includes? (get email :text) "ignore this email"))
+      (assert= :ok (mail/validate email))))
+
+  (test "a notice carries its paragraphs and its link"
+    (mail/outbox/preset *options*)
+    (let (email (mail/outbox/notice-email "ada@example.com"
+                  "A check failed"
+                  ["one" "two"]
+                  "https://acme.example/x"))
+      (assert= "A check failed" (get email :subject))
+      (assert= "one\n\ntwo\n\nhttps://acme.example/x\n" (get email :text))
+      (assert= :ok (mail/validate email))))
+
+  ;; An address is text a person typed. It reaches the HTML body through the renderer,
+  ;; never by concatenation.
+  (test "the address is escaped in the HTML body"
+    (mail/outbox/preset *options*)
+    (let (email (mail/outbox/confirmation-email {:id 1 :email "a<b@example.com"}
+                  "https://x/confirm/t"))
+      (is (includes? (get email :html) "a&lt;b@example.com"))
+      (is (not (includes? (get email :html) "a<b@example.com")))))
+
+  (test "the sender is the configured one, the default before start"
+    (mail/outbox/preset *options*)
+    (assert= "no-reply@acme.example"
+      (get (get (mail/outbox/confirmation-email *user* "u") :from) :email))
+    (mail/outbox/configure (mail/log-adapter)
+      (settings {"MAIL_FROM_NAME" "Shop" "MAIL_FROM_ADDRESS" "hi@example.org"}))
+    (assert= {:name "Shop" :email "hi@example.org"}
+      (get (mail/outbox/confirmation-email *user* "u") :from)))
+
+  (test "before any configuration a message is refused, naming what to call"
+    (mail/outbox/configure nil nil)
+    (is (includes? (try (mail/outbox/url "/x") (catch e (error-message e))) "mail/outbox/start")))
+
+  (test "a link is built on the configured base URL, the canonical site before start"
+    (mail/outbox/preset *options*)
+    (assert= "https://acme.example/confirm/t" (mail/outbox/url "/confirm/t"))
+    (mail/outbox/configure (mail/log-adapter) (settings {"ACME_BASE_URL" "http://localhost:5000"}))
+    (assert= "http://localhost:5000/confirm/t" (mail/outbox/url "/confirm/t")))
+
+  (test "deliver goes through the configured adapter, and deliver-later arrives"
+    (let (inbox (mail/memory-adapter :notify (self)))
+      (mail/outbox/configure inbox (settings {}))
+      (match (mail/outbox/deliver (mail/outbox/confirmation-email *user* "u"))
+        ([:ok _] (is true))
+        (other (is (= other :ok))))
+      (receive ([:mail email] (assert= "Confirm your Acme account" (get email :subject))))
+      (mail/outbox/deliver-later (mail/outbox/reset-password-email *user* "u"))
+      (receive ([:mail email] (assert= "Reset your Acme password" (get email :subject))))
+      (assert= 2 (count (mail/delivered inbox)))
+      (mail/stop inbox)
+      (mail/outbox/configure nil nil))))
