@@ -35,9 +35,14 @@
     (mail/subject "Hi")
     (mail/text-body "hello")))
 
+;; The request the transport was handed, its body decoded — which must be a JSON object, so a
+;; body that is anything else fails here rather than as a nil read further down.
 (defn- sent-request ()
   (receive
-    ([:request address body headers] [address (json/decode body) headers])
+    ([:request address body headers] (let (decoded (json/decode body))
+                                       (if (map? decoded)
+                                         [address decoded headers]
+                                         (error "the request body is not a JSON object: " body))))
     (after 1000 (error "the transport was not called"))))
 
 (describe "the request"
