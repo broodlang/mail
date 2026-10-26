@@ -35,7 +35,8 @@
   (:alias mail/mailjet)
   (:alias web/env)
   (:alias web/template)
-  (:alias log))
+  (:alias log)
+  (:alias registry))
 
 ;; ---- settings -----------------------------------------------------------------
 
@@ -125,8 +126,14 @@
 (defn preset (options)
   "Configure what the outbox uses until `start` runs: the log adapter, the default sender and
   links on `:site-url`. Called when the app's mailer module loads, so a test that renders a
-  link, or anything drawn before boot finishes, gets a real URL rather than an error."
-  (configure (mail/log-adapter) (settings {"HATCH_ENV" "prod"} options)))
+  link, or anything drawn before boot finishes, gets a real URL rather than an error.
+
+  The preset settings are also kept in `std/registry`, which the startup image carries: a
+  module loaded from the image does not run its top-level calls again, so the `configure`
+  here is lost there (ADR-218), and `setting` falls back to the registry's copy."
+  (let (config (settings {"HATCH_ENV" "prod"} options))
+    (registry/put! :mail/outbox :preset config)
+    (configure (mail/log-adapter) config)))
 
 (defn start (options)
   "Choose the adapter from the environment for the app's `options` (see `settings`) and say
@@ -159,9 +166,10 @@
   nil)
 
 (defn- setting (key)
-  (if (nil? *settings*)
-    (error "mail/outbox: not configured — call mail/outbox/start at boot")
-    (get *settings* key)))
+  (let (config (or *settings* (registry/lookup :mail/outbox :preset)))
+    (if (nil? config)
+      (error "mail/outbox: not configured — call mail/outbox/start at boot")
+      (get config key))))
 
 (defn base-url ()
   "What links are built on, from the running settings."

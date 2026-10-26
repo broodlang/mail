@@ -4,7 +4,8 @@
 (defmodule outbox-test
   (:use test)
   (:alias mail)
-  (:alias mail/outbox))
+  (:alias mail/outbox)
+  (:alias registry))
 
 (def *options*
   {:product "Acme"
@@ -132,7 +133,17 @@
 
   (test "before any configuration a message is refused, naming what to call"
     (mail/outbox/configure nil nil)
+    (registry/remove! :mail/outbox :preset)
     (is (includes? (try (mail/outbox/url "/x") (catch e (error-message e))) "mail/outbox/start")))
+
+  (test "the preset outlasts the running configuration, as a startup image keeps only it"
+    (mail/outbox/preset *options*)
+    ;; what a module loaded from the image sees: its top-level preset never ran in this
+    ;; process, so nothing is configured but the registry's copy
+    (mail/outbox/configure nil nil)
+    (assert= "https://acme.example/confirm/t" (mail/outbox/url "/confirm/t"))
+    (assert= "no-reply@acme.example"
+      (get (get (mail/outbox/confirmation-email *user* "u") :from) :email)))
 
   (test "a link is built on the configured base URL, the canonical site before start"
     (mail/outbox/preset *options*)
