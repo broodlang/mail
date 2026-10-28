@@ -63,7 +63,7 @@
   "An empty email, or one with fields set from a plist: `(new :to \"a@b.c\" :subject \"Hi\")`
   applies each key through the builder of the same name, so an address may be written any
   way `to` accepts."
-  (fold (partition opts 2)
+  (fold (seq/partition opts 2)
     {:from nil
      :to []
      :cc []
