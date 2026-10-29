@@ -14,7 +14,7 @@ telemetry, with the adapters an app reaches for first built in:
 Any other vendor is the same shape in its own package: a value with an `Adapter` impl
 (see *Writing an adapter*).
 
-```lisp
+```lisp fragment
 (def adapter (mail/mailjet/adapter {:api-key (os/env "MAILJET_API_KEY")
                                     :secret-key (os/env "MAILJET_SECRET_KEY")}))
 
@@ -67,7 +67,7 @@ local mailbox in dev, the log otherwise), the sender, the base URL every emailed
 built on (never the request's `Host`), the confirmation and password-reset emails
 `web/accounts` tokens travel in, and delivery off the request path.
 
-```brood
+```brood fragment
 (def *options* {:product "Acme"
                 :about "the widget shop"
                 :site-url "https://acme.example"
@@ -82,7 +82,7 @@ built on (never the request's `Host`), the confirmation and password-reset email
 
 ## The mailbox — `mail/local`
 
-```lisp
+```lisp fragment
 (def mailer (mail/local/adapter))          ; starts the keeper, registered :mail/local
 (mail/deliver email mailer)                ; → [:ok {:id 1}]
 (mail/local/emails)                        ; newest first, each stamped :id and :at
@@ -90,7 +90,7 @@ built on (never the request's `Host`), the confirmation and password-reset email
 
 In the router, behind whatever guards the operational pages:
 
-```lisp
+```lisp fragment
 (get "/mailbox" (mail/local/handler {:refresh-ms 4000}))
 (get "/mailbox/*path" (mail/local/handler {:refresh-ms 4000}))
 ```
