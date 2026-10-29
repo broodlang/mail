@@ -3,7 +3,7 @@
 ;; vendor is a value with an `Adapter` impl, in its own package.
 (project
   :name "mail"
-  :version "0.3.1"
+  :version "0.3.2"
   :brood ">= 0.47.0"
   :description
     "Compose an email and deliver it through a swappable adapter — Swoosh, for Brood. Builder, validation, telemetry; a local mailbox with a preview page and a Mailjet adapter built in; any vendor pluggable through the Adapter ability."
