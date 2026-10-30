@@ -115,7 +115,7 @@
 (defrecord scripted (name outcome))
 (impl Adapter
   scripted
-  (transmit [adapter email]
+  (transmit (adapter email)
     (let (outcome (get adapter :outcome))
       (if (= outcome :raise) (error "socket closed") outcome))))
 

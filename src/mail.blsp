@@ -55,7 +55,7 @@
   `[:ok result]` — `result` a map, `:id` the provider's message id when it has one —
   or `[:error message]`. A raise is caught by `mail/deliver` and becomes `[:error message]`,
   so an implementation may let `http/request`'s failures surface."
-  (transmit [self email] :-> any))
+  (transmit (self email) :-> any))
 
 ;; ---- composing --------------------------------------------------------------------------
 
@@ -302,7 +302,7 @@
 
 (impl Adapter
   memory
-  (transmit [adapter email]
+  (transmit (adapter email)
     (gen/cast (get adapter :pid) [:deliver email])
     [:ok {:id (str "memory-" (os/now))}]))
 
@@ -349,6 +349,6 @@
 
 (impl Adapter
   logging
-  (transmit [adapter email]
+  (transmit (adapter email)
     (log-line (get adapter :level) (summary email))
     [:ok {:id (str "log-" (os/now))}]))

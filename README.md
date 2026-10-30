@@ -130,7 +130,7 @@ The answer is read for what it is: a 400's `Errors` naming the field refused is 
 
 (impl Adapter
   postmark
-  (transmit [adapter email]        ; email is validated, addresses are {:name :email}
+  (transmit (adapter email)        ; email is validated, addresses are {:name :email}
     …                              ; → [:ok {:id …}] | [:error message]; a raise is caught
     ))
 ```

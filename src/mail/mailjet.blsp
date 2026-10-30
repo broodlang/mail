@@ -60,7 +60,7 @@
 
 (impl Adapter
   mailjet
-  (transmit [adapter email]
+  (transmit (adapter email)
     (let (resp ((get adapter :transport) (str (get adapter :endpoint) "/v3.1/send")
                  (json/encode (request adapter email))
                  (headers adapter)))

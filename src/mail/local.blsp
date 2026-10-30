@@ -122,7 +122,7 @@
 
 (impl Adapter
   local
-  (transmit [adapter email]
+  (transmit (adapter email)
     [:ok {:id (gen/call (get adapter :pid) [:deliver email])}]))
 
 (defn adapter ()
