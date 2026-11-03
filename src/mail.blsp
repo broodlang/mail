@@ -102,7 +102,7 @@
         {:name (nth value 0) :email (string/trim (str (nth value 1)))}
         (error "mail/address: a pair address is [name email]: " value))
     (string? value) (parse-address value)
-    :else (error "mail/address: not an address: " value)))
+    else (error "mail/address: not an address: " value)))
 
 ;; `Name <address>` or a bare address. The angle-bracket form is what a mail header carries
 ;; and what a person types, so it is read here rather than left to every caller.
@@ -116,7 +116,7 @@
         (let (name (string/trim (string/substring trimmed 0 open)))
           {:name (if (= name "") nil name)
            :email (string/trim (string/substring trimmed (+ open 1) close))})
-      :else {:name nil :email trimmed})))
+      else {:name nil :email trimmed})))
 
 ;; A vector is a LIST of addresses unless it reads as one `[name address]` pair: two strings
 ;; of which only the second has an `@`. `["ada@x" "bob@y"]` is two recipients; `["Ada" "ada@x"]`
@@ -238,7 +238,7 @@
     (empty? (recipients email)) [:error "mail: no recipient — set `to`, `cc` or `bcc`"]
     (and (nil? (get email :text)) (nil? (get email :html)))
       [:error "mail: no body — set `text-body` or `html-body`"]
-    :else :ok))
+    else :ok))
 
 (defn- elapsed-ms (started-ns)
   (/ (- (os/now-ns) started-ns) 1000000.0))

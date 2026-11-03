@@ -294,7 +294,7 @@
             (if entry (one links entry) [:p {:class "dim"} (str "No email #" id ".")])
             ;; one email is a still page; only the inbox refreshes
             (dissoc opts :refresh-ms)))
-      :else nil)))
+      else nil)))
 
 (defn resource (path &optional (opts {}))
   "The raw resource for `path` — `\"<id>/html\"` (the HTML body, for the page's iframe) or
@@ -322,7 +322,7 @@
                                                 (get att :filename)
                                                 "\"")}})
             nil))
-      :else nil)))
+      else nil)))
 
 (defn handler (&optional (opts {}))
   "A conn handler serving the mailbox. Mount it twice — on the prefix and on
@@ -339,7 +339,7 @@
             (web/conn/put-resp-header :cache-control "no-store")
             (web/conn/put-resp-header :content-type (get raw :content-type))
             (web/conn/send-resp 200 (get raw :body)))
-        :else
+        else
           (let (html (page path opts))
             (if (nil? html)
               (web/conn/not-found-resp conn)

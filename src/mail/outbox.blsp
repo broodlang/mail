@@ -82,7 +82,7 @@
     {:transport (cond
                   (and api-key secret-key) :mailjet
                   dev? :local
-                  :else :log)
+                  else :log)
      :mailjet (when (and api-key secret-key) {:api-key api-key :secret-key secret-key})
      :from {:name (web/env/as-text (get env "MAIL_FROM_NAME") (get default-from :name))
             :email (web/env/as-text (get env "MAIL_FROM_ADDRESS") (get default-from :email))}

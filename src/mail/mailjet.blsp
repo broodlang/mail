@@ -185,4 +185,4 @@
         [:error (str "mail/mailjet: " status " " (errors-text message))]
       (and (map? parsed) (get parsed :ErrorMessage))
         [:error (str "mail/mailjet: " status " " (get parsed :ErrorMessage))]
-      :else [:error (str "mail/mailjet: HTTP " status)])))
+      else [:error (str "mail/mailjet: HTTP " status)])))
