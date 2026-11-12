@@ -99,7 +99,7 @@
 ;; `https://example.org/` is how a base URL gets typed, and `(str base "/confirm/…")` on
 ;; it is a `//confirm/…` the router does not match — every emailed link would 404.
 (defn- without-trailing-slash (url)
-  (if (string/ends-with? url "/") (string/substring url 0 (- (string/length url) 1)) url))
+  (if (string/ends-with? url "/") (string/substring url 0 (- (count url) 1)) url))
 
 (defn adapter-for (config)
   "The adapter `config`'s `:transport` names."
@@ -132,7 +132,7 @@
   module loaded from the image does not run its top-level calls again, so the `configure`
   here is lost there (ADR-218), and `setting` falls back to the registry's copy."
   (let (config (settings {"HATCH_ENV" "prod"} options))
-    (registry/put! :mail/outbox :preset config)
+    (registry/put :mail/outbox :preset config)
     (configure (mail/log-adapter) config)))
 
 (defn start (options)

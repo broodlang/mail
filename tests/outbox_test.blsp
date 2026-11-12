@@ -133,7 +133,7 @@
 
   (test "before any configuration a message is refused, naming what to call"
     (mail/outbox/configure nil nil)
-    (registry/remove! :mail/outbox :preset)
+    (registry/remove :mail/outbox :preset)
     (is (includes? (try (mail/outbox/url "/x") (catch e (error-message e))) "mail/outbox/start")))
 
   (test "the preset outlasts the running configuration, as a startup image keeps only it"

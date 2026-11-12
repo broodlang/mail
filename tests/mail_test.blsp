@@ -138,7 +138,7 @@
     (let (me (self))
       (telemetry/attach :mail-test
         [:mail :deliver :stop]
-        (fn (event measurements metadata) (send me [:seen event metadata])))
+        (fn (event _measurements metadata) (send me [:seen event metadata])))
       (mail/deliver (ready) (scripted "s" [:ok {}]))
       (receive
         ([:seen event metadata] (assert= [:mail :deliver :stop] event)

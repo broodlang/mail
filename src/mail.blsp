@@ -200,7 +200,7 @@
   implies none."
   (let (extension (string/lower (path/extension (str filename)))
         bare (if (string/starts-with? extension ".")
-               (string/substring extension 1 (string/length extension))
+               (string/substring extension 1 (count extension))
                extension))
     (get *content-types* bare "application/octet-stream")))
 
@@ -244,7 +244,7 @@
   (/ (- (os/now-ns) started-ns) 1000000.0))
 
 (defn- adapter-name (adapter)
-  (str (or (and (map? adapter) (get adapter :name)) (type-of adapter))))
+  (str (or (and (or (map? adapter) (record? adapter)) (get adapter :name)) (type-of adapter))))
 
 (defn deliver (email adapter)
   "Deliver `email` through `adapter`. Validates first (`validate`), then calls the

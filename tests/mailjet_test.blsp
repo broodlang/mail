@@ -141,6 +141,6 @@
   (test "no response, and a body that is not JSON"
     (assert= [:error "mail/mailjet: connection refused"]
       (mail/deliver (ready)
-        (adapter-with {:status 0 :headers {} :body #b"" :error "connection refused"})))
+        (adapter-with (failure "connection refused"))))
     (assert= [:error "mail/mailjet: HTTP 502"]
       (mail/deliver (ready) (adapter-with (response 502 "<html>bad gateway</html>"))))))

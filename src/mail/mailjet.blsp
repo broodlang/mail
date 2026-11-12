@@ -169,12 +169,18 @@
   "A response as the delivery contract's answer. A 2xx whose message `Status` is
   `\"success\"` is `[:ok {:id :uuid :href}]` from the first recipient's receipt; anything
   else is `[:error message]` carrying Mailjet's own error text — the `Errors` of the
-  message when there is one, the flat `ErrorMessage` of a 401 otherwise."
-  (let (status (get resp :status 0)
+  message when there is one, the flat `ErrorMessage` of a 401 otherwise. No response at all
+  — `http/post`'s failure for a refused connection or a timeout — is `[:error message]` naming
+  why."
+  (if (failure? resp)
+    [:error (str "mail/mailjet: " (error-message resp))]
+    (answered-outcome resp)))
+
+(defn- answered-outcome (resp)
+  (let (status (get resp :status)
         parsed (body-json resp)
         message (first-message parsed))
     (cond
-      (= status 0) [:error (str "mail/mailjet: " (get resp :error "no response"))]
       (and (>= status 200) (< status 300) (map? message) (= (get message :Status) "success"))
         (let (receipt (or (first (get message :To)) {}))
           [:ok
