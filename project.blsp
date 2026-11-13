@@ -3,10 +3,10 @@
 ;; vendor is a value with an `Adapter` impl, in its own package.
 (project
   :name "mail"
-  :version "0.3.4"
-  :brood ">= 0.51.0"
+  :version "0.3.5"
+  :brood ">= 0.52.0"
   :description
     "Compose an email and deliver it through a swappable adapter — Swoosh, for Brood. Builder, validation, telemetry; a local mailbox with a preview page and a Mailjet adapter built in; any vendor pluggable through the Adapter ability."
   :repository "https://github.com/broodlang/mail"
   ;; hatch renders and serves the mailbox pages (`web/template`, `web/conn`).
-  :dependencies [[hatch :version "^0.31.2"]])
+  :dependencies [[hatch :version "^0.31.3"]])
