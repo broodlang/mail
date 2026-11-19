@@ -39,10 +39,11 @@
 ;; body that is anything else fails here rather than as a nil read further down.
 (defn- sent-request ()
   (receive
-    ([:request address body headers] (let (decoded (json/decode body))
-                                       (if (map? decoded)
-                                         [address decoded headers]
-                                         (error "the request body is not a JSON object: " body))))
+    ([:request address body headers]
+      (let (decoded (json/decode body))
+        (if (map? decoded)
+          [address decoded headers]
+          (error "the request body is not a JSON object: " body))))
     (after 1000 (error "the transport was not called"))))
 
 (describe "the request"

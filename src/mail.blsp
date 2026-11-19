@@ -199,9 +199,7 @@
   "The content type a file name's extension implies, `application/octet-stream` when it
   implies none."
   (let (extension (string/lower (path/extension (str filename)))
-        bare (if (string/starts-with? extension ".")
-               (string/substring extension 1 (count extension))
-               extension))
+        bare (match extension ((str "." rest) rest) (_ extension)))
     (get *content-types* bare "application/octet-stream")))
 
 (defn attachment (email spec)
