@@ -258,22 +258,23 @@
                   :subject (get email :subject "")})
     (match (validate email)
       ([:error message] [:error message])
-      (_ (try
-           (let (outcome (transmit adapter email)
-                 result (match outcome
-                          ([:ok _] outcome)
-                          ([:error _] outcome)
-                          (:ok [:ok {}])
-                          (other [:error (str "mail: adapter answered " (pr-str other))])))
-             (telemetry/emit [:mail :deliver :stop]
-               {:duration (elapsed-ms started)}
-               (assoc metadata :result (first result)))
-             result)
-           (catch caught
-             (telemetry/emit [:mail :deliver :exception]
-               {:duration (elapsed-ms started)}
-               (assoc metadata :error (error-message caught)))
-             [:error (str "mail: " (error-message caught))]))))))
+      (_
+        (try
+          (let (outcome (transmit adapter email)
+                result (match outcome
+                         ([:ok _] outcome)
+                         ([:error _] outcome)
+                         (:ok [:ok {}])
+                         (other [:error (str "mail: adapter answered " (pr-str other))])))
+            (telemetry/emit [:mail :deliver :stop]
+              {:duration (elapsed-ms started)}
+              (assoc metadata :result (first result)))
+            result)
+          (catch caught
+            (telemetry/emit [:mail :deliver :exception]
+              {:duration (elapsed-ms started)}
+              (assoc metadata :error (error-message caught)))
+            [:error (str "mail: " (error-message caught))]))))))
 
 ;; ---- the memory adapter ------------------------------------------------------------------
 ;; What a test uses: every delivered email is kept, newest last, and read back with
